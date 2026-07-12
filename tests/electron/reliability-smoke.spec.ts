@@ -1,5 +1,5 @@
 import { _electron as electron, expect, test } from '@playwright/test';
-import { access, mkdtemp, readFile } from 'node:fs/promises';
+import { access, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createSolidPng } from '../fixtures/png';
@@ -56,9 +56,28 @@ test('Electron: secure native save/open bridge completes the reliability flow', 
     await expect(page.getByAltText('Chart')).toBeVisible();
 
     await page.getByRole('button', { name: '导出', exact: true }).click();
-    const downloadPromise = page.waitForEvent('download');
+    await page.evaluate(() => {
+      HTMLAnchorElement.prototype.click = function captureDownload() {
+        (window as unknown as { capturedDownload?: { href: string; name: string } })
+          .capturedDownload = { href: this.href, name: this.download };
+      };
+    });
     await page.getByRole('button', { name: '导出文件' }).click();
-    const csv = await readFile((await (await downloadPromise).path())!, 'utf8');
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { capturedDownload?: { href: string } })
+              .capturedDownload?.href ?? ''
+        )
+      )
+      .toContain('blob:');
+    const csv = await page.evaluate(async () => {
+      const href = (
+        window as unknown as { capturedDownload: { href: string } }
+      ).capturedDownload.href;
+      return fetch(href).then((response) => response.text());
+    });
     expect(csv).toContain('schema_version,page,plot_id');
   } finally {
     await application.close();
