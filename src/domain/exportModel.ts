@@ -5,11 +5,13 @@ import {
   CurveSeries,
   DataPoint,
   ExportOptions,
+  ImageData,
   PageSession,
   PlotRegion
 } from '../types';
 import { formatNumber } from '../utils/coordinate';
 import { generateInterpolatedPoints } from '../utils/interpolation';
+import { getPointQualityFlags } from './calibration';
 
 export interface ExportDataParams {
   pageNumber?: number;
@@ -18,6 +20,7 @@ export interface ExportDataParams {
   axisConfig: { x: AxisConfig; y: AxisConfig };
   calibrationLines: CalibrationLines;
   calibrationValues: CalibrationValues;
+  imageData?: ImageData;
   pageSessions?: PageSession[];
   options: ExportOptions;
 }
@@ -34,6 +37,7 @@ export type ExportPage = Pick<
   | 'calibrationValues'
   | 'plotRegions'
   | 'activePlotId'
+  | 'imageData'
 >;
 
 export type ExportPlot = {
@@ -59,6 +63,188 @@ export type NameItem = {
   value: string;
 };
 
+export const CANONICAL_EXPORT_COLUMNS = [
+  'schema_version',
+  'page',
+  'plot_id',
+  'plot_name',
+  'data_type',
+  'series_id',
+  'series_name',
+  'point_id',
+  'point_index',
+  'label',
+  'x_label',
+  'x_scale',
+  'x_log_input_mode',
+  'x_formula',
+  'x_value',
+  'y_label',
+  'y_scale',
+  'y_log_input_mode',
+  'y_formula',
+  'y_value',
+  'interpolation',
+  'quality_flags'
+] as const;
+
+export type CanonicalExportColumn = (typeof CANONICAL_EXPORT_COLUMNS)[number];
+export type CanonicalExportRecord = Record<
+  CanonicalExportColumn,
+  string | number
+>;
+
+export function getSelectedExportPages(params: ExportDataParams): ExportPage[] {
+  const fallbackPage: ExportPage = {
+    pageNumber: params.pageNumber ?? 1,
+    imageData: params.imageData ?? {
+      src: null,
+      naturalWidth: 0,
+      naturalHeight: 0
+    },
+    dataPoints: params.dataPoints,
+    curves: params.curves,
+    axisConfig: params.axisConfig,
+    calibrationLines: params.calibrationLines,
+    calibrationValues: params.calibrationValues,
+    plotRegions: [],
+    activePlotId: ''
+  };
+  if (!params.pageSessions?.length) return [fallbackPage];
+  const selected =
+    params.options.pageScope === 'all'
+      ? params.pageSessions
+      : params.pageSessions.filter(
+          (page) => page.pageNumber === (params.pageNumber ?? 1)
+        );
+  return selected.length ? selected : [fallbackPage];
+}
+
+export function buildCanonicalRecords(
+  params: ExportDataParams
+): CanonicalExportRecord[] {
+  const scope = params.options.dataScope ?? 'all';
+  const records: CanonicalExportRecord[] = [];
+  expandExportPlots(getSelectedExportPages(params)).forEach((plot) => {
+    if (scope === 'points' || scope === 'all') {
+      plot.dataPoints.forEach((point, index) => {
+        records.push(
+          buildCanonicalRecord(plot, {
+            dataType: 'point',
+            seriesId: 'points',
+            seriesName: 'Points',
+            pointId: point.id,
+            pointIndex: index + 1,
+            label: point.label,
+            realX: point.realX,
+            realY: point.realY,
+            qualityFlags: point.qualityFlags ?? [],
+            interpolation: ''
+          })
+        );
+      });
+    }
+
+    plot.curves.forEach((curve) => {
+      if (scope === 'curve-controls' || scope === 'all') {
+        curve.controlPoints.forEach((point) => {
+          records.push(
+            buildCanonicalRecord(plot, {
+              dataType: 'curve_control',
+              seriesId: curve.id,
+              seriesName: curve.name,
+              pointId: point.id,
+              pointIndex: point.order,
+              label: point.label,
+              realX: point.realX,
+              realY: point.realY,
+              qualityFlags: point.qualityFlags ?? [],
+              interpolation: curve.interpolation
+            })
+          );
+        });
+      }
+      if (scope === 'curve-interpolated' || scope === 'all') {
+        generateInterpolatedPoints(
+          curve,
+          plot.axisConfig,
+          plot.calibrationLines,
+          plot.calibrationValues
+        ).forEach((point, index) => {
+          records.push(
+            buildCanonicalRecord(plot, {
+              dataType: 'curve_interpolated',
+              seriesId: curve.id,
+              seriesName: curve.name,
+              pointId: point.id,
+              pointIndex: index + 1,
+              label: `${curve.name} ${index + 1}`,
+              realX: point.realX,
+              realY: point.realY,
+              qualityFlags: getPointQualityFlags(
+                point.screenX,
+                point.screenY,
+                plot.calibrationLines
+              ),
+              interpolation: curve.interpolation
+            })
+          );
+        });
+      }
+    });
+  });
+  return records;
+}
+
+interface CanonicalPointInput {
+  dataType: string;
+  seriesId: string;
+  seriesName: string;
+  pointId: string;
+  pointIndex: number;
+  label: string;
+  realX: number;
+  realY: number;
+  qualityFlags: string[];
+  interpolation: string;
+}
+
+function buildCanonicalRecord(
+  plot: ExportPlot,
+  point: CanonicalPointInput
+): CanonicalExportRecord {
+  return {
+    schema_version: '2.1',
+    page: plot.pageNumber,
+    plot_id: plot.plotId,
+    plot_name: plot.plotName,
+    data_type: point.dataType,
+    series_id: point.seriesId,
+    series_name: point.seriesName,
+    point_id: point.pointId,
+    point_index: point.pointIndex,
+    label: point.label,
+    x_label: plot.axisConfig.x.label,
+    x_scale: plot.axisConfig.x.scale,
+    x_log_input_mode: logInputMode(plot.axisConfig.x),
+    x_formula: plot.axisConfig.x.formula ?? '',
+    x_value: point.realX,
+    y_label: plot.axisConfig.y.label,
+    y_scale: plot.axisConfig.y.scale,
+    y_log_input_mode: logInputMode(plot.axisConfig.y),
+    y_formula: plot.axisConfig.y.formula ?? '',
+    y_value: point.realY,
+    interpolation: point.interpolation,
+    quality_flags: point.qualityFlags.join(';')
+  };
+}
+
+function logInputMode(config: AxisConfig): string {
+  return ['log', 'log10', 'ln'].includes(config.scale)
+    ? config.logInputMode ?? 'value'
+    : '';
+}
+
 export function buildExportRows({
   pageNumber,
   dataPoints,
@@ -70,22 +256,16 @@ export function buildExportRows({
   options
 }: ExportDataParams): ExportRow[] {
   const scope = options.dataScope ?? 'all';
-  const fallbackPage = {
-    pageNumber: pageNumber ?? 1,
+  const pages = getSelectedExportPages({
+    pageNumber,
     dataPoints,
     curves,
     axisConfig,
     calibrationLines,
     calibrationValues,
-    plotRegions: [],
-    activePlotId: ''
-  };
-  const pagesFromSessions = pageSessions?.length
-    ? options.pageScope === 'all'
-      ? pageSessions
-      : pageSessions.filter((page) => page.pageNumber === (pageNumber ?? 1))
-    : [];
-  const pages = pagesFromSessions.length ? pagesFromSessions : [fallbackPage];
+    pageSessions,
+    options
+  });
   const rows: ExportRow[] = [];
 
   expandExportPlots(pages).forEach((plot) => {

@@ -4,11 +4,15 @@ import {
   CheckCircle,
   ChevronRight,
   Crosshair,
+  FolderOpen,
   Image as ImageIcon,
   Loader,
   Maximize2,
   RefreshCw,
+  Redo2,
   RotateCcw,
+  Save,
+  Undo2,
   Upload,
   XCircle,
   ZoomIn
@@ -20,6 +24,8 @@ import { CalibrationPanel } from './components/Sidebar/CalibrationPanel';
 import { DigitizingPanel } from './components/Sidebar/DigitizingPanel';
 import type { TracePoint } from './utils/autoTrace';
 import { detectCalibrationLinesFromRegion } from './utils/axisDetection';
+import { useProjectFiles } from './hooks/useProjectFiles';
+import { useRecovery } from './hooks/useRecovery';
 
 type AutoTracePreview = {
   curveId: string;
@@ -29,7 +35,18 @@ type AutoTracePreview = {
 } | null;
 
 function App() {
-  const { imageData, currentStep, resetApp, setCalibrationLine } = useAppStore();
+  const {
+    imageData,
+    currentStep,
+    resetApp,
+    setCalibrationLine,
+    isDirty,
+    canUndo,
+    canRedo,
+    undo,
+    redo,
+    sourceFile
+  } = useAppStore();
   const [zoomScale, setZoomScale] = useState<number | 'fit'>('fit');
   const [isRegionZoomMode, setIsRegionZoomMode] = useState(false);
   const [isCalibrationBoxMode, setIsCalibrationBoxMode] = useState(false);
@@ -48,6 +65,18 @@ function App() {
     isLoading,
     clearError
   } = useImageLoader();
+  const {
+    projectInputRef,
+    loadProjectBytes,
+    handleProjectFileChange,
+    openProject,
+    saveProject,
+    isProjectBusy,
+    projectError,
+    clearProjectError
+  } = useProjectFiles();
+  useRecovery(loadProjectBytes);
+  const displayError = error ?? projectError;
 
   useEffect(() => {
     const blockWheelDefault = (event: WheelEvent) => {
@@ -71,6 +100,35 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
+      }
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z') return;
+      event.preventDefault();
+      if (event.shiftKey) redo();
+      else undo();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [redo, undo]);
+
+  useEffect(() => {
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!isDirty) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isDirty]);
+
+  useEffect(() => {
     setAutoTracePreview(null);
   }, [imageData.src]);
 
@@ -82,7 +140,7 @@ function App() {
   }, [currentStep]);
 
   const handleReset = () => {
-    if (window.confirm('确定要重置所有内容吗？')) {
+    if (!isDirty || window.confirm('存在未保存修改，确定要重置所有内容吗？')) {
       resetApp();
       setZoomScale('fit');
       setIsRegionZoomMode(false);
@@ -184,15 +242,25 @@ function App() {
         onChange={handleFileChange}
         className="hidden"
       />
+      <input
+        type="file"
+        ref={projectInputRef}
+        accept=".plotdigitizer"
+        onChange={handleProjectFileChange}
+        className="hidden"
+      />
 
-      {error && (
+      {displayError && (
         <div className="bg-red-50 border-b border-red-200 p-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <XCircle size={16} className="text-red-500" />
-            <span className="text-sm text-red-700">{error}</span>
+            <span className="text-sm text-red-700">{displayError}</span>
           </div>
           <button
-            onClick={clearError}
+            onClick={() => {
+              clearError();
+              clearProjectError();
+            }}
             className="text-red-500 hover:text-red-700"
           >
             <XCircle size={16} />
@@ -213,7 +281,30 @@ function App() {
           </div>
         </div>
 
-        {isLoading && (
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => void openProject()}
+            disabled={isProjectBusy}
+            className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2.5 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+            title="打开 .plotdigitizer 项目"
+          >
+            <FolderOpen size={15} />
+            打开项目
+          </button>
+          <button
+            type="button"
+            onClick={() => void saveProject()}
+            disabled={!sourceFile || isProjectBusy}
+            className="inline-flex items-center gap-1 rounded border border-indigo-200 bg-indigo-50 px-2.5 py-2 text-xs font-bold text-indigo-700 hover:bg-indigo-100 disabled:opacity-40"
+            title="保存自包含项目"
+          >
+            <Save size={15} />
+            保存项目
+          </button>
+        </div>
+
+        {(isLoading || isProjectBusy) && (
           <div className="flex items-center gap-2 text-slate-500">
             <Loader size={16} className="animate-spin" />
             <span className="text-sm">加载中...</span>
@@ -247,6 +338,30 @@ function App() {
               </span>
               采集数据
             </div>
+          </div>
+        )}
+
+        {imageData.src && !isLoading && (
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={undo}
+              disabled={!canUndo}
+              className="rounded border border-slate-200 bg-white p-2 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-35"
+              title="撤销 (Ctrl+Z)"
+            >
+              <Undo2 size={16} />
+            </button>
+            <button
+              type="button"
+              onClick={redo}
+              disabled={!canRedo}
+              className="rounded border border-slate-200 bg-white p-2 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-35"
+              title="恢复 (Ctrl+Shift+Z)"
+            >
+              <Redo2 size={16} />
+            </button>
+            {isDirty && <span className="ml-1 text-[11px] text-amber-600">未保存</span>}
           </div>
         )}
 

@@ -1,43 +1,67 @@
 import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
 import pptxgen from 'pptxgenjs';
+import type { CalibrationIssue, ExportOptions, PlotRegion } from '../types';
 import {
-  ExportDataParams,
-  ExportPage,
-  ExportPlot,
+  CANONICAL_EXPORT_COLUMNS,
+  type ExportDataParams,
+  type ExportPlot,
+  buildCanonicalRecords,
   buildExportRows,
-  expandExportPlots
+  expandExportPlots,
+  getSelectedExportPages,
+  hasPlotOutput
 } from '../domain/exportModel';
-import { formatNumber } from '../utils/coordinate';
-import { generateInterpolatedPoints } from '../utils/interpolation';
+import { validateCalibration } from '../domain/calibration';
+
+export interface ExportValidationIssue {
+  pageNumber: number;
+  plotId: string;
+  plotName: string;
+  issue: CalibrationIssue;
+}
+
+export function validateExportParams(params: ExportDataParams): ExportValidationIssue[] {
+  return getSelectedExportPages(params).flatMap((page) => {
+    const plots = page.plotRegions.length
+      ? page.plotRegions.filter(hasPlotOutput)
+      : [fallbackPlot(params)];
+    return plots.flatMap((plot) =>
+      validateCalibration({
+        calibrationLines: plot.calibrationLines,
+        calibrationValues: plot.calibrationValues,
+        axisConfig: plot.axisConfig,
+        imageData:
+          page.imageData.naturalWidth > 0 && page.imageData.naturalHeight > 0
+            ? page.imageData
+            : undefined
+      }).issues
+        .filter((issue) => issue.severity === 'error')
+        .map((issue) => ({
+          pageNumber: page.pageNumber,
+          plotId: plot.id,
+          plotName: plot.name,
+          issue
+        }))
+    );
+  });
+}
 
 export function exportToCSV(params: ExportDataParams): string {
-  const delimiter = params.options.delimiter || ',';
-  const header = [
-    'Page',
-    'Plot',
-    'Data Type',
-    'Series',
-    'Index',
-    'Label',
-    params.axisConfig.x.label,
-    params.axisConfig.y.label
-  ];
-  const rows = buildExportRows(params);
-
-  return [header, ...rows]
-    .map((row) =>
-      row.map((value) => escapeCSVField(String(value), delimiter)).join(delimiter)
-    )
-    .join('\n');
+  assertExportValid(params);
+  if (params.options.schema === 'legacy-v2.0') return buildLegacyCsv(params);
+  return buildCanonicalCsv(params);
 }
 
 export function exportToXLSX(
   params: ExportDataParams,
   filename: string = 'data'
 ): string {
-  const workbookBytes = buildWorkbookBytes(params);
-
+  assertExportValid(params);
+  const workbookBytes =
+    params.options.schema === 'legacy-v2.0'
+      ? buildLegacyWorkbookBytes(params)
+      : buildWorkbookBytes(params);
   return downloadFile(
     workbookBytes,
     `${filename}.xlsx`,
@@ -57,46 +81,165 @@ export async function buildBundleBytes(
   params: ExportDataParams,
   packageBaseName: string = 'plotdigitizer_export'
 ): Promise<ArrayBuffer> {
+  assertExportValid(params);
   const zip = new JSZip();
-  const pages = getExportPages(params);
-  const plots = expandExportPlots(pages);
+  const canonicalParams: ExportDataParams = {
+    ...params,
+    options: { ...params.options, schema: 'v2.1' }
+  };
+  const plots = expandExportPlots(getSelectedExportPages(canonicalParams));
   const filePlans = buildPlotFilePlans(plots);
+  const safeBaseName = sanitizeFilename(packageBaseName) || 'plotdigitizer_export';
+  const csvPath = `canonical/${safeBaseName}-v2.1.csv`;
+  const xlsxPath = `canonical/${safeBaseName}-v2.1.xlsx`;
+  zip.file(csvPath, buildCanonicalCsv(canonicalParams));
+  zip.file(xlsxPath, buildWorkbookBytes(canonicalParams));
 
+  const screenshotPaths: string[] = [];
+  const plotWorkbookPaths: string[] = [];
   filePlans.forEach(({ plot, baseName }) => {
+    const workbookPath = `plots/${baseName}.xlsx`;
+    plotWorkbookPaths.push(workbookPath);
+    zip.file(
+      workbookPath,
+      buildWorkbookBytes(canonicalParams, {
+        pageNumber: plot.pageNumber,
+        plotId: plot.plotId
+      })
+    );
     if (plot.screenshot?.dataUrl) {
-      zip.file(
-        `screenshots/${baseName}.png`,
-        dataUrlToBase64(plot.screenshot.dataUrl),
-        { base64: true }
-      );
+      const screenshotPath = `screenshots/${baseName}.${dataUrlExtension(
+        plot.screenshot.dataUrl
+      )}`;
+      screenshotPaths.push(screenshotPath);
+      zip.file(screenshotPath, dataUrlToBase64(plot.screenshot.dataUrl), {
+        base64: true
+      });
     }
-
-    zip.file(`plots/${baseName}.xlsx`, buildPlotWorkbookBytes(plot, params));
   });
 
-  const pptxBytes = await buildSummaryPptx(filePlans);
-  zip.file(`${sanitizeFilename(packageBaseName) || 'plotdigitizer_export'}.pptx`, pptxBytes);
+  const summaryPath = `${safeBaseName}-summary.pptx`;
+  zip.file(summaryPath, await buildSummaryPptx(filePlans));
+  const legacyPaths: string[] = [];
+  if (params.options.schema === 'legacy-v2.0') {
+    const legacyCsvPath = `legacy/${safeBaseName}-legacy-v2.0.csv`;
+    const legacyXlsxPath = `legacy/${safeBaseName}-legacy-v2.0.xlsx`;
+    zip.file(legacyCsvPath, buildLegacyCsv(params));
+    zip.file(legacyXlsxPath, buildLegacyWorkbookBytes(params));
+    legacyPaths.push(legacyCsvPath, legacyXlsxPath);
+  }
 
-  return zip.generateAsync({ type: 'arraybuffer' });
+  const records = buildCanonicalRecords(canonicalParams);
+  zip.file(
+    'manifest.json',
+    JSON.stringify(
+      {
+        schema_version: '2.1',
+        generated_at: new Date().toISOString(),
+        canonical: {
+          csv: csvPath,
+          xlsx: xlsxPath,
+          row_count: records.length
+        },
+        plot_workbooks: plotWorkbookPaths,
+        screenshots: screenshotPaths,
+        summary_pptx: summaryPath,
+        legacy_files: legacyPaths
+      },
+      null,
+      2
+    )
+  );
+  return zip.generateAsync({
+    type: 'arraybuffer',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 }
+  });
+}
+
+export function buildCanonicalCsv(params: ExportDataParams): string {
+  const delimiter = params.options.delimiter || ',';
+  const valueMode = params.options.valueMode ?? 'full';
+  const records = buildCanonicalRecords(params);
+  return [
+    CANONICAL_EXPORT_COLUMNS.join(delimiter),
+    ...records.map((record) =>
+      CANONICAL_EXPORT_COLUMNS.map((column) => {
+        const raw = record[column];
+        const value =
+          (column === 'x_value' || column === 'y_value') && typeof raw === 'number'
+            ? formatCsvNumber(raw, valueMode, params.options.precision)
+            : String(raw);
+        return escapeCSVField(value, delimiter);
+      }).join(delimiter)
+    )
+  ].join('\n');
+}
+
+export function buildWorkbookBytes(
+  params: ExportDataParams,
+  filter?: { pageNumber: number; plotId: string }
+): ArrayBuffer {
+  const allRecords = buildCanonicalRecords(params);
+  const records = filter
+    ? allRecords.filter(
+        (record) =>
+          record.page === filter.pageNumber && record.plot_id === filter.plotId
+      )
+    : allRecords;
+  const allPlots = expandExportPlots(getSelectedExportPages(params));
+  const plots = filter
+    ? allPlots.filter(
+        (plot) =>
+          plot.pageNumber === filter.pageNumber && plot.plotId === filter.plotId
+      )
+    : allPlots;
+  const workbook = XLSX.utils.book_new();
+  const dataSheet = XLSX.utils.aoa_to_sheet([
+    [...CANONICAL_EXPORT_COLUMNS],
+    ...records.map((record) =>
+      CANONICAL_EXPORT_COLUMNS.map((column) => record[column])
+    )
+  ]);
+  applyDataSheetFormatting(dataSheet, records.length, params.options.precision);
+  XLSX.utils.book_append_sheet(workbook, dataSheet, 'Data');
+  XLSX.utils.book_append_sheet(
+    workbook,
+    XLSX.utils.json_to_sheet(plots.map(buildPlotMetadataRow)),
+    'Plots'
+  );
+  XLSX.utils.book_append_sheet(
+    workbook,
+    XLSX.utils.aoa_to_sheet([
+      ['key', 'value'],
+      ['schema_version', '2.1'],
+      ['generated_at', new Date().toISOString()],
+      ['page_count', new Set(plots.map((plot) => plot.pageNumber)).size],
+      ['plot_count', plots.length],
+      ['row_count', records.length],
+      ['source_name', params.imageData?.name ?? '']
+    ]),
+    'Project'
+  );
+  return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
 }
 
 export function createDownloadUrl(
   content: string | ArrayBuffer,
   mimeType: string
 ): string {
-  const blob = new Blob([content], { type: mimeType });
-  return URL.createObjectURL(blob);
+  return URL.createObjectURL(new Blob([content], { type: mimeType }));
 }
 
 export function triggerDownload(url: string, filename: string): void {
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.rel = 'noopener';
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = 'noopener';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
 }
 
 export function downloadFile(
@@ -114,51 +257,142 @@ export function revokeDownloadUrl(url: string): void {
 }
 
 export async function copyToClipboard(params: ExportDataParams): Promise<void> {
-  const tsv = exportToCSV({
+  const text = exportToCSV({
     ...params,
     options: { ...params.options, delimiter: '\t' }
   });
-
   if (navigator.clipboard?.writeText) {
     try {
-      await navigator.clipboard.writeText(tsv);
+      await navigator.clipboard.writeText(text);
       return;
     } catch (error) {
       console.warn('navigator.clipboard.writeText failed, using fallback.', error);
     }
   }
-
-  copyTextWithTextarea(tsv);
+  copyTextWithTextarea(text);
 }
 
-function getExportPages(params: ExportDataParams): ExportPage[] {
-  return params.options.pageScope === 'all' && params.pageSessions?.length
-    ? params.pageSessions
-    : [
-        {
-          pageNumber: params.pageNumber ?? 1,
-          dataPoints: params.dataPoints,
-          curves: params.curves,
-          axisConfig: params.axisConfig,
-          calibrationLines: params.calibrationLines,
-          calibrationValues: params.calibrationValues,
-          plotRegions: [],
-          activePlotId: ''
-        }
-      ];
+function assertExportValid(params: ExportDataParams): void {
+  const issues = validateExportParams(params);
+  if (issues.length > 0) {
+    const first = issues[0];
+    throw new Error(
+      `第 ${first.pageNumber} 页“${first.plotName}”校准无效：${first.issue.message}`
+    );
+  }
+}
+
+function fallbackPlot(params: ExportDataParams): PlotRegion {
+  return {
+    id: `page-${params.pageNumber ?? 1}`,
+    name: 'Figure 1',
+    calibrationLines: params.calibrationLines,
+    calibrationValues: params.calibrationValues,
+    axisConfig: params.axisConfig,
+    dataPoints: params.dataPoints,
+    curves: params.curves,
+    activeCurveId: null,
+    collectionMode: 'point',
+    defaultSampleLabel: 'Sample A'
+  };
+}
+
+function formatCsvNumber(
+  value: number,
+  mode: NonNullable<ExportOptions['valueMode']>,
+  precision: number
+): string {
+  if (!Number.isFinite(value)) throw new Error('导出数据包含非有限数值');
+  return mode === 'rounded' ? value.toFixed(precision) : value.toString();
+}
+
+function buildLegacyCsv(params: ExportDataParams): string {
+  const delimiter = params.options.delimiter || ',';
+  const header = [
+    'Page',
+    'Plot',
+    'Data Type',
+    'Series',
+    'Index',
+    'Label',
+    params.axisConfig.x.label,
+    params.axisConfig.y.label
+  ];
+  return [header, ...buildExportRows(params)]
+    .map((row) =>
+      row.map((value) => escapeCSVField(String(value), delimiter)).join(delimiter)
+    )
+    .join('\n');
+}
+
+function buildLegacyWorkbookBytes(params: ExportDataParams): ArrayBuffer {
+  const data = [
+    [
+      'Page',
+      'Plot',
+      'Data Type',
+      'Series',
+      'Index',
+      'Label',
+      params.axisConfig.x.label,
+      params.axisConfig.y.label
+    ],
+    ...buildExportRows(params)
+  ];
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(data), 'Data');
+  return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
+}
+
+function applyDataSheetFormatting(
+  worksheet: XLSX.WorkSheet,
+  rowCount: number,
+  precision: number
+): void {
+  const format = precision > 0 ? `0.${'0'.repeat(precision)}` : '0';
+  const xColumn = CANONICAL_EXPORT_COLUMNS.indexOf('x_value');
+  const yColumn = CANONICAL_EXPORT_COLUMNS.indexOf('y_value');
+  for (let row = 1; row <= rowCount; row += 1) {
+    [xColumn, yColumn].forEach((column) => {
+      const cell = worksheet[XLSX.utils.encode_cell({ r: row, c: column })];
+      if (cell) cell.z = format;
+    });
+  }
+  worksheet['!cols'] = CANONICAL_EXPORT_COLUMNS.map((column) => ({
+    wch: column.endsWith('_formula') ? 24 : Math.max(12, column.length + 2)
+  }));
+}
+
+function buildPlotMetadataRow(plot: ExportPlot): Record<string, string | number> {
+  return {
+    page: plot.pageNumber,
+    plot_id: plot.plotId,
+    plot_name: plot.plotName,
+    x_label: plot.axisConfig.x.label,
+    x_scale: plot.axisConfig.x.scale,
+    x_log_input_mode: plot.axisConfig.x.logInputMode ?? '',
+    x_formula: plot.axisConfig.x.formula ?? '',
+    x_screen_1: plot.calibrationLines.x1,
+    x_screen_2: plot.calibrationLines.x2,
+    x_value_1: plot.calibrationValues.x1,
+    x_value_2: plot.calibrationValues.x2,
+    y_label: plot.axisConfig.y.label,
+    y_scale: plot.axisConfig.y.scale,
+    y_log_input_mode: plot.axisConfig.y.logInputMode ?? '',
+    y_formula: plot.axisConfig.y.formula ?? '',
+    y_screen_1: plot.calibrationLines.y1,
+    y_screen_2: plot.calibrationLines.y2,
+    y_value_1: plot.calibrationValues.y1,
+    y_value_2: plot.calibrationValues.y2,
+    point_count: plot.dataPoints.length,
+    curve_count: plot.curves.length
+  };
 }
 
 function escapeCSVField(value: string, delimiter: string): string {
-  if (
-    value.includes(delimiter) ||
-    value.includes('"') ||
-    value.includes('\n') ||
-    value.includes('\r')
-  ) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-
-  return value;
+  return value.includes(delimiter) || /["\r\n]/.test(value)
+    ? `"${value.replace(/"/g, '""')}"`
+    : value;
 }
 
 function copyTextWithTextarea(text: string): void {
@@ -167,16 +401,10 @@ function copyTextWithTextarea(text: string): void {
   textarea.setAttribute('readonly', 'true');
   textarea.style.position = 'fixed';
   textarea.style.left = '-9999px';
-  textarea.style.top = '0';
   document.body.appendChild(textarea);
-  textarea.focus();
   textarea.select();
-
   try {
-    const copied = document.execCommand('copy');
-    if (!copied) {
-      throw new Error('document.execCommand("copy") returned false.');
-    }
+    if (!document.execCommand('copy')) throw new Error('浏览器拒绝复制');
   } finally {
     document.body.removeChild(textarea);
   }
@@ -191,8 +419,7 @@ async function buildSummaryPptx(
   pptx.subject = 'PlotDigitizer export summary';
   pptx.title = 'PlotDigitizer Export Summary';
   pptx.company = 'PlotDigitizer';
-
-  if (!filePlans.length) {
+  if (filePlans.length === 0) {
     const slide = pptx.addSlide();
     slide.addText('PlotDigitizer Export Summary', {
       x: 0.6,
@@ -204,20 +431,9 @@ async function buildSummaryPptx(
       bold: true,
       color: '1f2937'
     });
-    slide.addText('No plot data was available at export time.', {
-      x: 0.6,
-      y: 1.3,
-      w: 12,
-      h: 0.4,
-      fontFace: 'Arial',
-      fontSize: 14,
-      color: '475569'
-    });
   }
-
   filePlans.forEach(({ plot }) => {
     const slide = pptx.addSlide();
-
     slide.background = { color: 'F8FAFC' };
     slide.addText(`Page ${plot.pageNumber} - ${plot.plotName}`, {
       x: 0.45,
@@ -230,7 +446,6 @@ async function buildSummaryPptx(
       color: '111827',
       fit: 'shrink'
     });
-
     if (plot.screenshot?.dataUrl) {
       slide.addImage({
         data: plot.screenshot.dataUrl,
@@ -242,130 +457,24 @@ async function buildSummaryPptx(
       });
     }
   });
-
-  const output = await pptx.write({ outputType: 'arraybuffer' });
-  return output as ArrayBuffer;
+  return (await pptx.write({ outputType: 'arraybuffer' })) as ArrayBuffer;
 }
 
-function buildWorkbookBytes(params: ExportDataParams): ArrayBuffer {
-  const data = [
-    [
-      'Page',
-      'Plot',
-      'Data Type',
-      'Series',
-      'Index',
-      'Label',
-      params.axisConfig.x.label,
-      params.axisConfig.y.label
-    ],
-    ...buildExportRows(params)
-  ];
-
-  const worksheet = XLSX.utils.aoa_to_sheet(data);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
-  return XLSX.write(workbook, {
-    bookType: 'xlsx',
-    type: 'array'
-  }) as ArrayBuffer;
-}
-
-function buildPlotWorkbookBytes(
-  plot: ExportPlot,
-  params: ExportDataParams
-): ArrayBuffer {
-  const worksheet = XLSX.utils.aoa_to_sheet(
-    buildPlotWideRows(plot, params.options.precision)
-  );
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
-
-  return XLSX.write(workbook, {
-    bookType: 'xlsx',
-    type: 'array'
-  }) as ArrayBuffer;
-}
-
-function buildPlotWideRows(
-  plot: ExportPlot,
-  precision: number
-): Array<Array<string | number>> {
-  const xLabel = getAxisLabel(plot.axisConfig.x.label, 'X');
-  const yLabel = getAxisLabel(plot.axisConfig.y.label, 'Y');
-  const series = dedupeExportNames([
-    ...plot.curves.map((curve, index) => ({
-      name: curve.name.trim() || `Curve ${index + 1}`,
-      points: generateInterpolatedPoints(
-        curve,
-        plot.axisConfig,
-        plot.calibrationLines,
-        plot.calibrationValues
-      ).map((point) => ({
-        realX: point.realX,
-        realY: point.realY
-      }))
-    })),
-    ...plot.dataPoints.map((point, index) => ({
-      name: point.label.trim() || `Point ${index + 1}`,
-      points: [
-        {
-          realX: point.realX,
-          realY: point.realY
-        }
-      ]
-    }))
-  ]);
-
-  if (!series.length) {
-    return [['No data']];
-  }
-
-  const headerNames: Array<string | number> = [];
-  const axisNames: Array<string | number> = [];
-
-  series.forEach((item) => {
-    headerNames.push(item.exportName, item.exportName);
-    axisNames.push(xLabel, yLabel);
-  });
-
-  const maxRows = Math.max(...series.map((item) => item.points.length), 1);
-  const rows: Array<Array<string | number>> = [headerNames, axisNames];
-
-  for (let index = 0; index < maxRows; index += 1) {
-    const row: Array<string | number> = [];
-
-    series.forEach((item) => {
-      const point = item.points[index];
-      row.push(
-        point
-          ? formatNumber(point.realX, plot.axisConfig.x.scale, precision)
-          : '',
-        point
-          ? formatNumber(point.realY, plot.axisConfig.y.scale, precision)
-          : ''
-      );
-    });
-
-    rows.push(row);
-  }
-
-  return rows;
-}
-
-function dedupeExportNames<T extends { name: string }>(
-  items: T[]
-): Array<T & { exportName: string }> {
-  const usedNames = new Map<string, number>();
-
-  return items.map((item) => {
-    const name = item.name.trim();
-    const count = usedNames.get(name) ?? 0;
-    usedNames.set(name, count + 1);
-
+function buildPlotFilePlans(plots: ExportPlot[]): Array<{
+  plot: ExportPlot;
+  baseName: string;
+}> {
+  const used = new Map<string, number>();
+  return plots.map((plot) => {
+    const proposed =
+      sanitizeFilename(
+        `p${String(plot.pageNumber).padStart(3, '0')}_${plot.plotName}`
+      ) || `p${String(plot.pageNumber).padStart(3, '0')}_plot`;
+    const count = used.get(proposed) ?? 0;
+    used.set(proposed, count + 1);
     return {
-      ...item,
-      exportName: count === 0 ? name : `${name}_${count + 1}`
+      plot,
+      baseName: count === 0 ? proposed : `${proposed}_${count + 1}`
     };
   });
 }
@@ -374,27 +483,11 @@ function dataUrlToBase64(dataUrl: string): string {
   return dataUrl.split(',')[1] ?? '';
 }
 
-function buildPlotFilePlans(plots: ExportPlot[]): Array<{
-  plot: ExportPlot;
-  baseName: string;
-}> {
-  const usedNames = new Map<string, number>();
-
-  return plots.map((plot) => {
-    const rawBaseName = `p${String(plot.pageNumber).padStart(3, '0')}_${plot.plotName}`;
-    const safeBaseName = sanitizeFilename(rawBaseName) || `p${String(plot.pageNumber).padStart(3, '0')}_plot`;
-    const count = usedNames.get(safeBaseName) ?? 0;
-    usedNames.set(safeBaseName, count + 1);
-
-    return {
-      plot,
-      baseName: count === 0 ? safeBaseName : `${safeBaseName}_${count + 1}`
-    };
-  });
-}
-
-function getAxisLabel(label: string | undefined, fallback: string): string {
-  return label?.trim() || fallback;
+function dataUrlExtension(dataUrl: string): string {
+  if (dataUrl.startsWith('data:image/jpeg')) return 'jpg';
+  if (dataUrl.startsWith('data:image/webp')) return 'webp';
+  if (dataUrl.startsWith('data:image/gif')) return 'gif';
+  return 'png';
 }
 
 function sanitizeFilename(filename: string): string {

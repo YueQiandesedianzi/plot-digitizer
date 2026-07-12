@@ -41,3 +41,6 @@ output
 # Build files
 build
 .cache
+coverage
+playwright-report
+test-results

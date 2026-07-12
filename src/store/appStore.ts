@@ -41,6 +41,12 @@ const curveColors = ['#2563eb', '#dc2626', '#16a34a', '#9333ea', '#ea580c', '#08
 const createId = (prefix: string) =>
   `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+const createProjectId = () =>
+  globalThis.crypto?.randomUUID?.() ?? createId('project');
+
+const initialProjectCreatedAt = new Date().toISOString();
+const initialProjectId = createProjectId();
+
 const getNextCurveName = (curves: CurveSeries[]) => {
   const names = new Set(curves.map((curve) => curve.name.trim()).filter(Boolean));
   let index = 1;
@@ -276,9 +282,10 @@ const recalculatePoint = (
   point: { screenX: number; screenY: number },
   calibrationLines: CalibrationLines,
   calibrationValues: CalibrationValues,
-  axisConfig: AppState['axisConfig']
+  axisConfig: AppState['axisConfig'],
+  imageData: Pick<ImageData, 'naturalWidth' | 'naturalHeight'>
 ) => {
-  const { realX, realY } = calculateRealValue({
+  const result = calculateRealValue({
     screenX: point.screenX,
     screenY: point.screenY,
     calibrationLines,
@@ -288,10 +295,17 @@ const recalculatePoint = (
     axisLogInputModes: {
       x: axisConfig.x.logInputMode,
       y: axisConfig.y.logInputMode
-    }
+    },
+    imageData
   });
 
-  return { realX, realY };
+  return result.ok
+    ? {
+        realX: result.realX,
+        realY: result.realY,
+        qualityFlags: result.qualityFlags
+      }
+    : {};
 };
 
 const recalculateCollectedValues = (
@@ -302,13 +316,13 @@ const recalculateCollectedValues = (
 ) => ({
   dataPoints: state.dataPoints.map((point) => ({
     ...point,
-    ...recalculatePoint(point, calibrationLines, calibrationValues, axisConfig)
+    ...recalculatePoint(point, calibrationLines, calibrationValues, axisConfig, state.imageData)
   })),
   curves: state.curves.map((curve) => ({
     ...curve,
     controlPoints: curve.controlPoints.map((point) => ({
       ...point,
-      ...recalculatePoint(point, calibrationLines, calibrationValues, axisConfig)
+      ...recalculatePoint(point, calibrationLines, calibrationValues, axisConfig, state.imageData)
     }))
   }))
 });
@@ -323,11 +337,217 @@ const movePercentPoint = (
   screenY: Math.max(0, Math.min(100, Number.isFinite(nextScreenY) ? nextScreenY : screenY))
 });
 
+type EditSnapshot = Pick<
+  AppState,
+  | 'calibrationLines'
+  | 'calibrationValues'
+  | 'axisConfig'
+  | 'dataPoints'
+  | 'curves'
+  | 'activeCurveId'
+  | 'currentStep'
+  | 'collectionMode'
+  | 'defaultSampleLabel'
+  | 'plotRegions'
+  | 'activePlotId'
+>;
+
+interface PageHistory {
+  past: EditSnapshot[];
+  future: EditSnapshot[];
+  lastGroup?: string;
+  lastRecordedAt?: number;
+}
+
+interface HistoryOptions {
+  group?: string;
+  mergeWindowMs?: number;
+}
+
+const HISTORY_LIMIT = 50;
+const historyByPage = new Map<number, PageHistory>();
+
+const cloneSnapshot = (state: EditSnapshot): EditSnapshot =>
+  structuredClone({
+    calibrationLines: state.calibrationLines,
+    calibrationValues: state.calibrationValues,
+    axisConfig: state.axisConfig,
+    dataPoints: state.dataPoints,
+    curves: state.curves,
+    activeCurveId: state.activeCurveId,
+    currentStep: state.currentStep,
+    collectionMode: state.collectionMode,
+    defaultSampleLabel: state.defaultSampleLabel,
+    plotRegions: state.plotRegions,
+    activePlotId: state.activePlotId
+  });
+
+const captureSnapshot = (state: AppState): EditSnapshot => cloneSnapshot(state);
+
+const getPageHistory = (pageNumber: number): PageHistory => {
+  const existing = historyByPage.get(pageNumber);
+  if (existing) return existing;
+  const created: PageHistory = { past: [], future: [] };
+  historyByPage.set(pageNumber, created);
+  return created;
+};
+
+const getHistoryAvailability = (pageNumber: number) => {
+  const history = getPageHistory(pageNumber);
+  return {
+    canUndo: history.past.length > 0,
+    canRedo: history.future.length > 0
+  };
+};
+
+const recordHistory = (state: AppState, options: HistoryOptions = {}) => {
+  const history = getPageHistory(state.currentPageNumber);
+  const now = Date.now();
+  const shouldMerge =
+    Boolean(options.group) &&
+    history.lastGroup === options.group &&
+    history.lastRecordedAt !== undefined &&
+    now - history.lastRecordedAt <= (options.mergeWindowMs ?? 0);
+
+  if (!shouldMerge) {
+    history.past.push(captureSnapshot(state));
+    if (history.past.length > HISTORY_LIMIT) history.past.shift();
+  }
+  history.future = [];
+  history.lastGroup = options.group;
+  history.lastRecordedAt = now;
+};
+
+const clearAllHistory = () => historyByPage.clear();
+
 const initialPlot = createBlankPlotRegion(1);
 
-export const useAppStore = create<AppState>((set) => ({
+export const useAppStore = create<AppState>((set, get) => {
+  type StoreUpdater = (state: AppState) => Partial<AppState> | AppState;
+  const setWithHistory = (updater: StoreUpdater, options: HistoryOptions = {}) =>
+    set((state) => {
+      const next = updater(state);
+      if (next === state) return state;
+      recordHistory(state, options);
+      return {
+        ...next,
+        isDirty: true,
+        changeRevision: state.changeRevision + 1,
+        ...getHistoryAvailability(state.currentPageNumber)
+      };
+    });
+
+  const setDirty = (updater: StoreUpdater) =>
+    set((state) => {
+      const next = updater(state);
+      if (next === state) return state;
+      return {
+        ...next,
+        isDirty: true,
+        changeRevision: state.changeRevision + 1
+      };
+    });
+
+  return ({
+  // Project lifecycle and history
+  isDirty: false,
+  changeRevision: 0,
+  projectId: initialProjectId,
+  projectCreatedAt: initialProjectCreatedAt,
+  projectUpdatedAt: initialProjectCreatedAt,
+  projectFileName: null,
+  canUndo: false,
+  canRedo: false,
+  markDirty: () => setDirty(() => ({})),
+  markSaved: (updatedAt) =>
+    set(() => ({
+      isDirty: false,
+      projectUpdatedAt: updatedAt ?? new Date().toISOString()
+    })),
+  setProjectFileName: (name) => set(() => ({ projectFileName: name })),
+  clearHistory: () => {
+    clearAllHistory();
+    set(() => ({ canUndo: false, canRedo: false }));
+  },
+  commitHistoryBoundary: () => {
+    const history = getPageHistory(get().currentPageNumber);
+    history.lastGroup = undefined;
+    history.lastRecordedAt = undefined;
+  },
+  undo: () =>
+    set((state) => {
+      const history = getPageHistory(state.currentPageNumber);
+      const previous = history.past.pop();
+      if (!previous) return state;
+      history.future.push(captureSnapshot(state));
+      history.lastGroup = undefined;
+      history.lastRecordedAt = undefined;
+      return {
+        ...cloneSnapshot(previous),
+        isDirty: true,
+        changeRevision: state.changeRevision + 1,
+        ...getHistoryAvailability(state.currentPageNumber)
+      };
+    }),
+  redo: () =>
+    set((state) => {
+      const history = getPageHistory(state.currentPageNumber);
+      const next = history.future.pop();
+      if (!next) return state;
+      history.past.push(captureSnapshot(state));
+      if (history.past.length > HISTORY_LIMIT) history.past.shift();
+      history.lastGroup = undefined;
+      history.lastRecordedAt = undefined;
+      return {
+        ...cloneSnapshot(next),
+        isDirty: true,
+        changeRevision: state.changeRevision + 1,
+        ...getHistoryAvailability(state.currentPageNumber)
+      };
+    }),
+  replaceProject: (replacement) => {
+    clearAllHistory();
+    set((state) => {
+      const pageNumber = replacement.document.currentPageNumber;
+      const currentSession = replacement.pageSessions[pageNumber];
+      if (!currentSession) throw new Error('项目缺少当前页面数据');
+      const plotRegions = normalizePlotRegions(currentSession);
+      const activePlot =
+        plotRegions.find((plot) => plot.id === currentSession.activePlotId) ??
+        plotRegions[0];
+
+      return {
+        projectId: replacement.document.projectId,
+        projectCreatedAt: replacement.document.createdAt,
+        projectUpdatedAt: replacement.document.updatedAt,
+        projectFileName: replacement.fileName ?? null,
+        sourceFile: replacement.sourceFile,
+        sourceKind: replacement.document.source.kind,
+        sourcePageCount: replacement.document.source.pageCount,
+        imageData: { ...replacement.currentImage },
+        currentPageNumber: pageNumber,
+        pageSessions: replacement.pageSessions,
+        plotRegions,
+        activePlotId: activePlot.id,
+        currentStep: currentSession.currentStep,
+        showCoordinateGuide:
+          replacement.document.preferences.showCoordinateGuide,
+        showMagnifierDataOverlay:
+          replacement.document.preferences.showMagnifierDataOverlay,
+        ...restorePlotFields(activePlot),
+        isDirty: false,
+        canUndo: false,
+        canRedo: false,
+        changeRevision: state.changeRevision + 1
+      };
+    });
+  },
+
   // Image
   imageData: initialImageData,
+  sourceFile: null,
+  sourceKind: null,
+  sourcePageCount: 0,
   setImageData: (data) =>
     set((state) => ({
       imageData: { ...state.imageData, ...data }
@@ -336,6 +556,40 @@ export const useAppStore = create<AppState>((set) => ({
     set(() => ({
       imageData: initialImageData
     })),
+  replaceSource: (replacement) => {
+    clearAllHistory();
+    set((state) => {
+      const plot = createBlankPlotRegion(1);
+      const now = new Date().toISOString();
+      return {
+        projectId: createProjectId(),
+        projectCreatedAt: now,
+        projectUpdatedAt: now,
+        projectFileName: null,
+        imageData: { ...replacement.firstPageImage },
+        sourceFile: replacement.file,
+        sourceKind: replacement.kind,
+        sourcePageCount: replacement.pageCount,
+        calibrationLines: cloneCalibrationLines(),
+        calibrationValues: cloneCalibrationValues(),
+        axisConfig: cloneAxisConfig(),
+        dataPoints: [],
+        curves: [],
+        activeCurveId: null,
+        currentStep: 'calibration',
+        collectionMode: 'point',
+        defaultSampleLabel: 'Sample A',
+        currentPageNumber: 1,
+        pageSessions: {},
+        plotRegions: [plot],
+        activePlotId: plot.id,
+        isDirty: true,
+        canUndo: false,
+        canRedo: false,
+        changeRevision: state.changeRevision + 1
+      };
+    });
+  },
 
   // Calibration
   calibrationLines: initialCalibrationLines,
@@ -343,7 +597,7 @@ export const useAppStore = create<AppState>((set) => ({
   axisConfig: cloneAxisConfig(),
 
   setCalibrationLine: (key, value) =>
-    set((state) => {
+    setWithHistory((state) => {
       const calibrationLines = { ...state.calibrationLines, [key]: value };
       return {
         calibrationLines,
@@ -354,10 +608,10 @@ export const useAppStore = create<AppState>((set) => ({
           state.axisConfig
         )
       };
-    }),
+    }, { group: `calibration-line:${key}`, mergeWindowMs: 300 }),
 
   setCalibrationValue: (key, value) =>
-    set((state) => {
+    setWithHistory((state) => {
       const calibrationValues = { ...state.calibrationValues, [key]: value };
       return {
         calibrationValues,
@@ -368,10 +622,10 @@ export const useAppStore = create<AppState>((set) => ({
           state.axisConfig
         )
       };
-    }),
+    }, { group: `calibration-value:${key}`, mergeWindowMs: Number.POSITIVE_INFINITY }),
 
   setAxisScale: (axis, scale) =>
-    set((state) => {
+    setWithHistory((state) => {
       const axisConfig = {
         ...state.axisConfig,
         [axis]: { ...state.axisConfig[axis], scale }
@@ -388,15 +642,15 @@ export const useAppStore = create<AppState>((set) => ({
     }),
 
   setAxisLabel: (axis, label) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       axisConfig: {
         ...state.axisConfig,
         [axis]: { ...state.axisConfig[axis], label }
       }
-    })),
+    }), { group: `axis-label:${axis}`, mergeWindowMs: Number.POSITIVE_INFINITY }),
 
   setAxisFormula: (axis, formula) =>
-    set((state) => {
+    setWithHistory((state) => {
       const axisConfig = {
         ...state.axisConfig,
         [axis]: { ...state.axisConfig[axis], formula }
@@ -410,10 +664,10 @@ export const useAppStore = create<AppState>((set) => ({
           axisConfig
         )
       };
-    }),
+    }, { group: `axis-formula:${axis}`, mergeWindowMs: Number.POSITIVE_INFINITY }),
 
   setAxisLogInputMode: (axis, mode) =>
-    set((state) => {
+    setWithHistory((state) => {
       const axisConfig = {
         ...state.axisConfig,
         [axis]: { ...state.axisConfig[axis], logInputMode: mode }
@@ -430,26 +684,26 @@ export const useAppStore = create<AppState>((set) => ({
     }),
 
   showCoordinateGuide: false,
-  setShowCoordinateGuide: (visible) => set(() => ({ showCoordinateGuide: visible })),
+  setShowCoordinateGuide: (visible) => setDirty(() => ({ showCoordinateGuide: visible })),
   showMagnifierDataOverlay: true,
   setShowMagnifierDataOverlay: (visible) =>
-    set(() => ({ showMagnifierDataOverlay: visible })),
+    setDirty(() => ({ showMagnifierDataOverlay: visible })),
 
   // Data points
   dataPoints: [],
   addDataPoint: (point) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       dataPoints: [
         ...state.dataPoints,
         { ...point, id: createId('point'), visible: true }
       ]
     })),
   deleteDataPoint: (id) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       dataPoints: state.dataPoints.filter((p) => p.id !== id)
     })),
   updateDataPointPosition: (id, screenX, screenY) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       dataPoints: state.dataPoints.map((point) => {
         if (point.id !== id) return point;
         const moved = movePercentPoint(point.screenX, point.screenY, screenX, screenY);
@@ -460,31 +714,32 @@ export const useAppStore = create<AppState>((set) => ({
             moved,
             state.calibrationLines,
             state.calibrationValues,
-            state.axisConfig
+            state.axisConfig,
+            state.imageData
           )
         };
       })
-    })),
+    }), { group: `data-point-position:${id}`, mergeWindowMs: 300 }),
   updateDataPointLabel: (id, label) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       dataPoints: state.dataPoints.map((p) =>
         p.id === id ? { ...p, label } : p
       )
-    })),
+    }), { group: `data-point-label:${id}`, mergeWindowMs: Number.POSITIVE_INFINITY }),
   updateDataPointVisibility: (id, visible) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       dataPoints: state.dataPoints.map((point) =>
         point.id === id ? { ...point, visible } : point
       )
     })),
-  clearDataPoints: () => set(() => ({ dataPoints: [] })),
+  clearDataPoints: () => setWithHistory(() => ({ dataPoints: [] })),
 
   // Curve series
   curves: [],
   activeCurveId: null,
   createCurve: (name) => {
     const id = createId('curve');
-    set((state) => {
+    setWithHistory((state) => {
       const curve: CurveSeries = {
         id,
         name: name?.trim() || getNextCurveName(state.curves),
@@ -503,22 +758,22 @@ export const useAppStore = create<AppState>((set) => ({
     });
     return id;
   },
-  setActiveCurve: (id) => set(() => ({ activeCurveId: id })),
+  setActiveCurve: (id) => setDirty(() => ({ activeCurveId: id })),
   updateCurve: (id, patch) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       curves: state.curves.map((curve) =>
         curve.id === id ? { ...curve, ...patch } : curve
       )
-    })),
+    }), { group: `curve-update:${id}`, mergeWindowMs: Number.POSITIVE_INFINITY }),
   deleteCurve: (id) =>
-    set((state) => {
+    setWithHistory((state) => {
       const curves = state.curves.filter((curve) => curve.id !== id);
       const activeCurveId =
         state.activeCurveId === id ? curves[0]?.id ?? null : state.activeCurveId;
       return { curves, activeCurveId };
     }),
   addCurvePoint: (point) =>
-    set((state) => {
+    setWithHistory((state) => {
       const activeCurveId = state.activeCurveId ?? state.curves[0]?.id ?? null;
       if (!activeCurveId) return state;
 
@@ -541,7 +796,7 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   addCurvePointsToCurve: (curveId, points) =>
-    set((state) => {
+    setWithHistory((state) => {
       if (points.length === 0) return state;
 
       return {
@@ -565,7 +820,7 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   updateCurvePointPosition: (curveId, pointId, screenX, screenY) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       curves: state.curves.map((curve) => {
         if (curve.id !== curveId) return curve;
 
@@ -586,15 +841,16 @@ export const useAppStore = create<AppState>((set) => ({
                 moved,
                 state.calibrationLines,
                 state.calibrationValues,
-                state.axisConfig
+                state.axisConfig,
+                state.imageData
               )
             };
           })
         };
       })
-    })),
+    }), { group: `curve-point-position:${curveId}:${pointId}`, mergeWindowMs: 300 }),
   deleteCurvePoint: (curveId, pointId) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       curves: state.curves.map((curve) =>
         curve.id === curveId
           ? {
@@ -607,19 +863,19 @@ export const useAppStore = create<AppState>((set) => ({
       )
     })),
   clearCurvePoints: (curveId) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       curves: state.curves.map((curve) =>
         curve.id === curveId ? { ...curve, controlPoints: [] } : curve
       )
     })),
-  clearCurves: () => set(() => ({ curves: [], activeCurveId: null })),
+  clearCurves: () => setWithHistory(() => ({ curves: [], activeCurveId: null })),
 
   // Plot regions
   plotRegions: [initialPlot],
   activePlotId: initialPlot.id,
   createPlotRegion: (name) => {
     const id = createId('plot');
-    set((state) => {
+    setWithHistory((state) => {
       const committed = commitActivePlot(state);
       const nextPlot: PlotRegion = {
         ...createBlankPlotRegion(committed.length + 1, name),
@@ -650,13 +906,13 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   updatePlotRegionName: (id, name) =>
-    set((state) => ({
+    setWithHistory((state) => ({
       plotRegions: state.plotRegions.map((plot) =>
         plot.id === id ? { ...plot, name } : plot
       )
-    })),
+    }), { group: `plot-name:${id}`, mergeWindowMs: Number.POSITIVE_INFINITY }),
   deletePlotRegion: (id) =>
-    set((state) => {
+    setWithHistory((state) => {
       const committed = commitActivePlot(state);
       if (committed.length <= 1) return state;
 
@@ -674,7 +930,7 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   savePlotScreenshot: (screenshot) =>
-    set((state) => {
+    setWithHistory((state) => {
       const committed = commitActivePlot(state);
       return {
         plotRegions: committed.map((plot) =>
@@ -685,7 +941,7 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   deletePlotScreenshot: (plotId) =>
-    set((state) => {
+    setWithHistory((state) => {
       const targetPlotId = plotId ?? state.activePlotId;
       const committed = commitActivePlot(state);
       return {
@@ -697,23 +953,33 @@ export const useAppStore = create<AppState>((set) => ({
 
   // Step
   currentStep: 'calibration',
-  setCurrentStep: (step) => set(() => ({ currentStep: step })),
+  setCurrentStep: (step) => setDirty(() => ({ currentStep: step })),
 
   // Collection mode
   collectionMode: 'point',
-  setCollectionMode: (mode) => set(() => ({ collectionMode: mode })),
+  setCollectionMode: (mode) => setDirty(() => ({ collectionMode: mode })),
 
   // Default label
   defaultSampleLabel: 'Sample A',
-  setDefaultSampleLabel: (label) => set(() => ({ defaultSampleLabel: label })),
+  setDefaultSampleLabel: (label) =>
+    setDirty(() => ({ defaultSampleLabel: label })),
 
   // Reset all
-  resetApp: () =>
-    set(() => {
+  resetApp: () => {
+    clearAllHistory();
+    set((state) => {
       const plot = createBlankPlotRegion(1);
+      const now = new Date().toISOString();
 
       return {
+        projectId: createProjectId(),
+        projectCreatedAt: now,
+        projectUpdatedAt: now,
+        projectFileName: null,
         imageData: initialImageData,
+        sourceFile: null,
+        sourceKind: null,
+        sourcePageCount: 0,
         calibrationLines: cloneCalibrationLines(),
         calibrationValues: cloneCalibrationValues(),
         axisConfig: cloneAxisConfig(),
@@ -728,14 +994,22 @@ export const useAppStore = create<AppState>((set) => ({
         currentPageNumber: 1,
         pageSessions: {},
         plotRegions: [plot],
-        activePlotId: plot.id
+        activePlotId: plot.id,
+        isDirty: false,
+        canUndo: false,
+        canRedo: false,
+        changeRevision: state.changeRevision + 1
       };
-    }),
+    });
+  },
 
   // Page sessions for PDF/page-based collection
   currentPageNumber: 1,
   setCurrentPageNumber: (pageNumber) =>
-    set(() => ({ currentPageNumber: pageNumber })),
+    set(() => ({
+      currentPageNumber: pageNumber,
+      ...getHistoryAvailability(pageNumber)
+    })),
   pageSessions: {},
   saveCurrentPageSession: (pageNumber) =>
     set((state) => {
@@ -786,7 +1060,8 @@ export const useAppStore = create<AppState>((set) => ({
           plotRegions,
           activePlotId: activePlot.id,
           currentStep: saved.currentStep,
-          ...restorePlotFields(activePlot)
+          ...restorePlotFields(activePlot),
+          ...getHistoryAvailability(pageNumber)
         };
       }
 
@@ -802,11 +1077,12 @@ export const useAppStore = create<AppState>((set) => ({
         plotRegions: [plot],
         activePlotId: plot.id,
         currentStep: 'calibration',
-        ...restorePlotFields(plot)
+        ...restorePlotFields(plot),
+        ...getHistoryAvailability(pageNumber)
       };
     }),
   deleteExportItem: (pageNumber, kind, plotId, targetId) =>
-    set((state) => {
+    setWithHistory((state) => {
       const committed = commitActivePlot(state);
       const pageSessions = { ...state.pageSessions };
 
@@ -885,14 +1161,19 @@ export const useAppStore = create<AppState>((set) => ({
         pageSessions
       };
     }),
-  resetPageSessions: () =>
+  resetPageSessions: () => {
+    clearAllHistory();
     set(() => {
       const plot = createBlankPlotRegion(1);
       return {
         pageSessions: {},
         plotRegions: [plot],
         activePlotId: plot.id,
+        canUndo: false,
+        canRedo: false,
         ...restorePlotFields(plot)
       };
-    })
-}));
+    });
+  }
+  });
+});

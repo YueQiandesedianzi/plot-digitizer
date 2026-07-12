@@ -23,7 +23,7 @@ export function CalibrationPanel({
   detectStatus = '',
   onToggleBoxDetect
 }: CalibrationPanelProps) {
-  const { setCurrentStep } = useAppStore();
+  const { setCurrentStep, commitHistoryBoundary } = useAppStore();
   const {
     presets: xTitlePresets,
     savePreset: saveXTitle,
@@ -43,6 +43,7 @@ export function CalibrationPanel({
   const {
     calibrationValues,
     axisConfig,
+    calibrationValidation,
     setCalibrationValue,
     setAxisScale,
     setAxisLabel,
@@ -130,7 +131,10 @@ export function CalibrationPanel({
   };
 
   return (
-    <div className="flex flex-col h-full animate-in slide-in-from-right-4 duration-300">
+    <div
+      className="flex flex-col h-full animate-in slide-in-from-right-4 duration-300"
+      onBlurCapture={commitHistoryBoundary}
+    >
       <div className="p-5 border-b border-slate-100 bg-slate-50/50">
         <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2 mb-4">
           <Settings size={16} className="text-indigo-600" />
@@ -382,9 +386,26 @@ export function CalibrationPanel({
       </div>
 
       <div className="p-5 mt-auto border-t border-slate-200 bg-white">
+        {calibrationValidation.issues.length > 0 && (
+          <div className="mb-3 space-y-1">
+            {calibrationValidation.issues.map((issue) => (
+              <div
+                key={`${issue.axis}-${issue.code}`}
+                className={`rounded border px-2 py-1.5 text-[11px] ${
+                  issue.severity === 'error'
+                    ? 'border-red-200 bg-red-50 text-red-700'
+                    : 'border-amber-200 bg-amber-50 text-amber-700'
+                }`}
+              >
+                {issue.message}
+              </div>
+            ))}
+          </div>
+        )}
         <button
           onClick={() => setCurrentStep('digitizing')}
-          className="w-full py-3 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold shadow-lg shadow-green-200 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+          disabled={!calibrationValidation.valid}
+          className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:bg-slate-300 disabled:shadow-none disabled:cursor-not-allowed text-white rounded-lg font-bold shadow-lg shadow-green-200 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
         >
           <CheckCircle size={18} />
           确认校准 & 开始采集
