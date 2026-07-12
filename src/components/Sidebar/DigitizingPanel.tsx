@@ -112,6 +112,7 @@ export function DigitizingPanel({
 }: DigitizingPanelProps) {
   const {
     currentPageNumber,
+    commitHistoryBoundary,
     imageData,
     setCurrentStep,
     dataPoints,
@@ -284,8 +285,8 @@ export function DigitizingPanel({
   };
 
   const buildCurvePointsFromTrace = (curveName: string, points: TracePoint[]) =>
-    points.map((point) => {
-      const { realX, realY } = calculateRealValue({
+    points.flatMap((point) => {
+      const result = calculateRealValue({
         screenX: point.screenX,
         screenY: point.screenY,
         calibrationLines,
@@ -295,16 +296,21 @@ export function DigitizingPanel({
         axisLogInputModes: {
           x: axisConfig.x.logInputMode,
           y: axisConfig.y.logInputMode
-        }
+        },
+        imageData
       });
+      if (!result.ok) return [];
 
-      return {
-        screenX: point.screenX,
-        screenY: point.screenY,
-        realX,
-        realY,
-        label: curveName
-      };
+      return [
+        {
+          screenX: point.screenX,
+          screenY: point.screenY,
+          realX: result.realX,
+          realY: result.realY,
+          label: curveName,
+          qualityFlags: result.qualityFlags
+        }
+      ];
     });
 
   const clearTracePreview = (curveId: string) => {
@@ -404,7 +410,10 @@ export function DigitizingPanel({
   };
 
   return (
-    <div className="flex flex-col h-full animate-in slide-in-from-right-4 duration-300">
+    <div
+      className="flex flex-col h-full animate-in slide-in-from-right-4 duration-300"
+      onBlurCapture={commitHistoryBoundary}
+    >
       <div className="p-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
         <div className="flex items-center gap-2 text-xs text-slate-500">
           <Lock size={12} />

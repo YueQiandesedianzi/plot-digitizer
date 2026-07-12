@@ -3,7 +3,7 @@ import { AlertCircle, Check, Copy, Download, Trash2, X } from 'lucide-react';
 import { useAppStore } from '../../store/appStore';
 import {
   applyNameOverrides,
-  buildExportRows,
+  buildCanonicalRecords,
   buildNameItems,
   expandExportPlots,
   filterSessionsForExport,
@@ -15,7 +15,8 @@ import {
   exportBundle,
   exportToCSV,
   exportToXLSX,
-  revokeDownloadUrl
+  revokeDownloadUrl,
+  validateExportParams
 } from '../../services/exportFiles';
 import { ExportOptions, PageSession } from '../../types';
 import { generateInterpolatedPoints } from '../../utils/interpolation';
@@ -69,8 +70,10 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
   const [exportOptions, setExportOptions] = useState<ExportOptions>({
     format: 'csv',
     precision: 4,
+    schema: 'v2.1',
+    valueMode: 'full',
     delimiter: ',',
-    dataScope: 'curve-interpolated',
+    dataScope: 'all',
     pageScope: 'current'
   });
   const [copied, setCopied] = useState(false);
@@ -193,12 +196,12 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
       plot.curves.reduce(
         (curveSum, curve) =>
           curveSum +
-          generateInterpolatedPoints(
+          safeInterpolatedCount(
             curve,
             plot.axisConfig,
             plot.calibrationLines,
             plot.calibrationValues
-          ).length,
+          ),
         0
       ),
     0
@@ -215,6 +218,7 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
       axisConfig,
       calibrationLines,
       calibrationValues,
+      imageData,
       pageSessions: renamedPageSessions,
       options: exportOptions
     }),
@@ -226,11 +230,26 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
       curves,
       dataPoints,
       exportOptions,
+      imageData,
       renamedPageSessions
     ]
   );
-  const selectedRowCount = useMemo(() => buildExportRows(params).length, [params]);
-  const hasExportableData = selectedRowCount > 0;
+  const selectedRowCount = useMemo(
+    () => {
+      try {
+        return buildCanonicalRecords(params).length;
+      } catch {
+        return 0;
+      }
+    },
+    [params]
+  );
+  const exportValidationIssues = useMemo(
+    () => validateExportParams(params),
+    [params]
+  );
+  const hasValidCalibration = exportValidationIssues.length === 0;
+  const hasExportableData = selectedRowCount > 0 && hasValidCalibration;
 
   useEffect(() => {
     if (!isOpen && downloadLink) {
@@ -368,6 +387,13 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
   };
 
   const handleDeleteNameItem = (item: NameItem) => {
+    if (
+      !window.confirm(
+        `确定永久删除“${nameOverrides[item.key] ?? item.value}”吗？此操作可用 Ctrl+Z 撤销。`
+      )
+    ) {
+      return;
+    }
     deleteExportItem(item.pageNumber, item.kind, item.plotId, item.targetId);
     setExcludedKeys((prev) => {
       const next = { ...prev };
@@ -462,9 +488,81 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
             </div>
           </div>
 
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-sm font-medium text-slate-700 mb-2 block">
+                文件格式
+              </label>
+              <div className="flex gap-1">
+                {(['csv', 'xlsx'] as const).map((format) => (
+                  <button
+                    key={format}
+                    type="button"
+                    onClick={() => setOption({ format })}
+                    className={`flex-1 rounded px-2 py-2 text-xs font-bold uppercase ${
+                      exportOptions.format === format
+                        ? 'bg-indigo-600 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {format}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label className="text-sm font-medium text-slate-700 mb-2 block">
+                Schema
+              </label>
+              <div className="flex gap-1">
+                {(['v2.1', 'legacy-v2.0'] as const).map((schema) => (
+                  <button
+                    key={schema}
+                    type="button"
+                    onClick={() => setOption({ schema })}
+                    className={`flex-1 rounded px-1 py-2 text-[10px] font-bold ${
+                      exportOptions.schema === schema
+                        ? 'bg-indigo-600 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {schema}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
           <div>
             <label className="text-sm font-medium text-slate-700 mb-2 block">
-              小数位数: {exportOptions.precision}
+              CSV 数值文本
+            </label>
+            <div className="flex gap-2">
+              {([
+                ['full', '完整可往返'],
+                ['rounded', '明确舍入']
+              ] as const).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setOption({ valueMode: mode })}
+                  className={`flex-1 rounded px-2 py-2 text-xs font-bold ${
+                    exportOptions.valueMode === mode
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-slate-100 text-slate-600'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className="text-sm font-medium text-slate-700 mb-2 block">
+              {exportOptions.valueMode === 'rounded'
+                ? '明确舍入小数位'
+                : 'XLSX 显示小数位'}: {exportOptions.precision}
             </label>
             <input
               type="range"
@@ -484,7 +582,7 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
                 导出命名确认
               </span>
               <span className="text-[11px] text-slate-400">
-                {nameItems.length} 项
+                {nameItems.length} 项 · 取消勾选仅影响本次导出
               </span>
             </div>
             <div className="max-h-40 overflow-auto p-2 space-y-1">
@@ -533,7 +631,7 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
                       }}
                       onDoubleClick={(event) => event.stopPropagation()}
                       className="flex h-7 w-7 items-center justify-center rounded text-slate-300 hover:bg-red-50 hover:text-red-500"
-                      title="删除数据"
+                      title="永久删除源数据（可撤销）"
                     >
                       <Trash2 size={13} />
                     </button>
@@ -546,6 +644,17 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
           <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
             当前选择将导出 <span className="font-bold">{selectedRowCount}</span> 行数据。
           </div>
+
+          {!hasValidCalibration && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              <div className="font-bold">校准无效，导出已阻止</div>
+              {exportValidationIssues.slice(0, 3).map((item) => (
+                <div key={`${item.pageNumber}-${item.plotId}-${item.issue.code}`}>
+                  P{item.pageNumber} {item.plotName}：{item.issue.message}
+                </div>
+              ))}
+            </div>
+          )}
 
           {status && (
             <div
@@ -608,9 +717,9 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
         <div className="px-4 pb-4 bg-slate-50 shrink-0">
           <button
             onClick={handleBundleExport}
-            disabled={!hasExportableData && screenshotCount === 0}
+            disabled={!hasValidCalibration || (!hasExportableData && screenshotCount === 0)}
             className={`w-full py-2.5 px-4 rounded-lg font-bold transition-all flex items-center justify-center gap-2 ${
-              !hasExportableData && screenshotCount === 0
+              !hasValidCalibration || (!hasExportableData && screenshotCount === 0)
                 ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                 : 'bg-slate-900 text-white hover:bg-slate-800'
             }`}
@@ -622,4 +731,22 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
       </div>
     </div>
   );
+}
+
+function safeInterpolatedCount(
+  curve: Parameters<typeof generateInterpolatedPoints>[0],
+  axisConfig: Parameters<typeof generateInterpolatedPoints>[1],
+  calibrationLines: Parameters<typeof generateInterpolatedPoints>[2],
+  calibrationValues: Parameters<typeof generateInterpolatedPoints>[3]
+): number {
+  try {
+    return generateInterpolatedPoints(
+      curve,
+      axisConfig,
+      calibrationLines,
+      calibrationValues
+    ).length;
+  } catch {
+    return 0;
+  }
 }

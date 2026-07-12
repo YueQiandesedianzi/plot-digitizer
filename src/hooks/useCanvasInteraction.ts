@@ -73,7 +73,7 @@ export function useCanvasInteraction() {
       const percentX = (clientX / rect.width) * 100;
       const percentY = (clientY / rect.height) * 100;
 
-      const { realX, realY } = calculateRealValue({
+      const result = calculateRealValue({
         screenX: percentX,
         screenY: percentY,
         calibrationLines,
@@ -83,15 +83,18 @@ export function useCanvasInteraction() {
         axisLogInputModes: {
           x: axisConfig.x.logInputMode,
           y: axisConfig.y.logInputMode
-        }
+        },
+        imageData
       });
+      if (!result.ok) return;
 
       const point = {
         screenX: percentX,
         screenY: percentY,
-        realX,
-        realY,
-        label: defaultSampleLabel
+        realX: result.realX,
+        realY: result.realY,
+        label: defaultSampleLabel,
+        qualityFlags: result.qualityFlags
       };
 
       if (collectionMode === 'curve') {

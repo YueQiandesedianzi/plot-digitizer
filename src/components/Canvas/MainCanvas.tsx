@@ -368,7 +368,11 @@ export function MainCanvas({
         point.visible === false ? null : (
         <div
           key={point.id}
-          className="absolute w-3 h-3 bg-green-500 border-2 border-white rounded-full shadow-[0_2px_4px_rgba(0,0,0,0.2)] transform -translate-x-1/2 -translate-y-1/2 pointer-events-none z-20 flex items-center justify-center"
+          className={`absolute w-3 h-3 bg-green-500 border-2 rounded-full shadow-[0_2px_4px_rgba(0,0,0,0.2)] transform -translate-x-1/2 -translate-y-1/2 pointer-events-none z-20 flex items-center justify-center ${
+            point.qualityFlags?.includes('outside-calibration')
+              ? 'border-amber-400 ring-2 ring-amber-300'
+              : 'border-white'
+          }`}
           style={{ left: `${point.screenX}%`, top: `${point.screenY}%` }}
         >
           {currentStep === 'digitizing' && collectionMode === 'point' && (
@@ -385,8 +389,12 @@ export function MainCanvas({
           ? curve.controlPoints.map((point) => (
               <div
                 key={point.id}
-                className={`absolute w-3.5 h-3.5 border-2 border-white rounded-full shadow-[0_2px_5px_rgba(0,0,0,0.3)] transform -translate-x-1/2 -translate-y-1/2 pointer-events-none z-30 ${
-                  curve.id === activeCurveId ? 'ring-2 ring-white' : 'opacity-70'
+                className={`absolute w-3.5 h-3.5 border-2 rounded-full shadow-[0_2px_5px_rgba(0,0,0,0.3)] transform -translate-x-1/2 -translate-y-1/2 pointer-events-none z-30 ${
+                  point.qualityFlags?.includes('outside-calibration')
+                    ? 'border-amber-400 ring-2 ring-amber-300'
+                    : curve.id === activeCurveId
+                      ? 'border-white ring-2 ring-white'
+                      : 'border-white opacity-70'
                 }`}
                 style={{
                   left: `${point.screenX}%`,
@@ -444,16 +452,14 @@ export function MainCanvas({
             }}
           >
             {(() => {
-              const { realX, realY } = getRealCoordinates(
-                magnifier.pctX,
-                magnifier.pctY
-              );
+              const result = getRealCoordinates(magnifier.pctX, magnifier.pctY);
+              if (!result.ok) return '校准无效';
               return `${axisConfig.x.label || 'X'}: ${formatNumber(
-                realX,
+                result.realX,
                 axisConfig.x.scale,
                 4
               )}  ${axisConfig.y.label || 'Y'}: ${formatNumber(
-                realY,
+                result.realY,
                 axisConfig.y.scale,
                 4
               )}`;
@@ -544,15 +550,13 @@ export function MainCanvas({
           <div className="absolute bottom-0 left-0 w-full text-center text-[10px] font-mono font-medium bg-slate-900/80 text-white py-1 backdrop-blur-sm">
             {currentStep === 'digitizing'
               ? (() => {
-                  const { realX, realY } = getRealCoordinates(
-                    magnifier.pctX,
-                    magnifier.pctY
-                  );
+                  const result = getRealCoordinates(magnifier.pctX, magnifier.pctY);
+                  if (!result.ok) return '校准无效';
                   return `X:${formatNumber(
-                    realX,
+                    result.realX,
                     axisConfig.x.scale,
                     4
-                  )} Y:${formatNumber(realY, axisConfig.y.scale, 4)}`;
+                  )} Y:${formatNumber(result.realY, axisConfig.y.scale, 4)}`;
                 })()
               : '校准中...'}
           </div>

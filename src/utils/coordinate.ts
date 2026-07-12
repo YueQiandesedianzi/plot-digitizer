@@ -1,4 +1,15 @@
-import { AxisScale, CalibrationLines, CalibrationValues, LogInputMode } from '../types';
+import type {
+  AxisConfig,
+  AxisScale,
+  CalibrationIssue,
+  CalibrationLines,
+  CalibrationValues,
+  CoordinateResult,
+  ImageData,
+  LogInputMode
+} from '../types';
+import { getPointQualityFlags, validateCalibration } from '../domain/calibration';
+import { evaluateAxisFormula } from './formula';
 
 export interface AxisTransformConfig {
   scale: AxisScale;
@@ -14,6 +25,7 @@ export interface CalculateRealValueParams {
   axisScales: { x: AxisScale; y: AxisScale };
   axisFormulas?: { x?: string; y?: string };
   axisLogInputModes?: { x?: LogInputMode; y?: LogInputMode };
+  imageData?: Pick<ImageData, 'naturalWidth' | 'naturalHeight'>;
 }
 
 export interface CalculateScreenValueParams {
@@ -30,136 +42,8 @@ export function isLogScale(scale: AxisScale): boolean {
   return scale === 'log' || scale === 'log10' || scale === 'ln';
 }
 
-function safePositive(value: number) {
-  return value > 0 ? value : 1e-9;
-}
-
 function usesExponentTicks(axis: AxisTransformConfig) {
   return isLogScale(axis.scale) && axis.logInputMode === 'exponent';
-}
-
-function normalizeFormula(formula: string) {
-  let expression = formula;
-
-  while (expression.includes('^')) {
-    const powerIndex = expression.indexOf('^');
-    const left = readPowerOperand(expression, powerIndex - 1, -1);
-    const right = readPowerOperand(expression, powerIndex + 1, 1);
-
-    if (!left || !right) break;
-
-    expression =
-      expression.slice(0, left.start) +
-      `pow(${left.value}, ${right.value})` +
-      expression.slice(right.end + 1);
-  }
-
-  return expression;
-}
-
-function readPowerOperand(
-  expression: string,
-  startIndex: number,
-  direction: 1 | -1
-) {
-  let index = startIndex;
-  while (/\s/.test(expression[index] ?? '')) {
-    index += direction;
-  }
-
-  if (expression[index] === (direction === -1 ? ')' : '(')) {
-    let depth = 0;
-    const open = direction === -1 ? '(' : ')';
-    const close = direction === -1 ? ')' : '(';
-    let cursor = index;
-
-    while (cursor >= 0 && cursor < expression.length) {
-      if (expression[cursor] === close) depth += 1;
-      if (expression[cursor] === open) depth -= 1;
-      if (depth === 0) {
-        const start = Math.min(cursor, index);
-        const end = Math.max(cursor, index);
-        return {
-          start,
-          end,
-          value: expression.slice(start, end + 1)
-        };
-      }
-      cursor += direction;
-    }
-
-    return null;
-  }
-
-  const tokenPattern = /[A-Za-z0-9_.-]/;
-  let cursor = index;
-  while (
-    cursor >= 0 &&
-    cursor < expression.length &&
-    tokenPattern.test(expression[cursor])
-  ) {
-    cursor += direction;
-  }
-
-  const start = direction === -1 ? cursor + 1 : index;
-  const end = direction === -1 ? index : cursor - 1;
-  const value = expression.slice(start, end + 1);
-  return value ? { start, end, value } : null;
-}
-
-function evaluateCustomFormula(
-  formula: string | undefined,
-  t: number,
-  value1: number,
-  value2: number
-) {
-  if (!formula?.trim()) {
-    return value1 + t * (value2 - value1);
-  }
-
-  try {
-    const expression = normalizeFormula(formula);
-    const fn = new Function(
-      't',
-      'v1',
-      'v2',
-      'min',
-      'max',
-      'start',
-      'end',
-      'Math',
-      'log10',
-      'ln',
-      'log',
-      'exp',
-      'pow',
-      'sqrt',
-      'abs',
-      `"use strict"; return (${expression});`
-    );
-    const result = Number(
-      fn(
-        t,
-        value1,
-        value2,
-        Math.min(value1, value2),
-        Math.max(value1, value2),
-        value1,
-        value2,
-        Math,
-        Math.log10,
-        Math.log,
-        Math.log,
-        Math.exp,
-        Math.pow,
-        Math.sqrt,
-        Math.abs
-      )
-    );
-    return Number.isFinite(result) ? result : value1 + t * (value2 - value1);
-  } catch {
-    return value1 + t * (value2 - value1);
-  }
 }
 
 export function interpolateAxisValue(
@@ -169,7 +53,8 @@ export function interpolateAxisValue(
   value2: number
 ) {
   if (axis.scale === 'custom') {
-    return evaluateCustomFormula(axis.formula, ratio, value1, value2);
+    if (!axis.formula?.trim()) throw new Error('自定义公式不能为空');
+    return evaluateAxisFormula(axis.formula, { t: ratio, v1: value1, v2: value2 });
   }
 
   if (isLogScale(axis.scale)) {
@@ -178,10 +63,10 @@ export function interpolateAxisValue(
       return axis.scale === 'ln' ? Math.exp(exponent) : Math.pow(10, exponent);
     }
 
-    const safeValue1 = safePositive(value1);
-    const safeValue2 = safePositive(value2);
-    const logValue =
-      Math.log(safeValue1) + ratio * (Math.log(safeValue2) - Math.log(safeValue1));
+    if (value1 <= 0 || value2 <= 0) {
+      throw new RangeError('对数轴真实数必须大于 0');
+    }
+    const logValue = Math.log(value1) + ratio * (Math.log(value2) - Math.log(value1));
     return Math.exp(logValue);
   }
 
@@ -199,21 +84,16 @@ export function resolveAxisRatio(
   }
 
   if (isLogScale(axis.scale)) {
+    if (value <= 0) throw new RangeError('对数轴坐标必须大于 0');
     if (usesExponentTicks(axis)) {
-      const exponent =
-        axis.scale === 'ln'
-          ? Math.log(safePositive(value))
-          : Math.log10(safePositive(value));
+      const exponent = axis.scale === 'ln' ? Math.log(value) : Math.log10(value);
       return (exponent - value1) / (value2 - value1);
     }
 
-    const safeValue = safePositive(value);
-    const safeValue1 = safePositive(value1);
-    const safeValue2 = safePositive(value2);
-    return (
-      (Math.log(safeValue) - Math.log(safeValue1)) /
-      (Math.log(safeValue2) - Math.log(safeValue1))
-    );
+    if (value1 <= 0 || value2 <= 0) {
+      throw new RangeError('对数轴真实数必须大于 0');
+    }
+    return (Math.log(value) - Math.log(value1)) / (Math.log(value2) - Math.log(value1));
   }
 
   return (value - value1) / (value2 - value1);
@@ -225,16 +105,17 @@ function solveCustomAxisRatio(
   value1: number,
   value2: number
 ) {
-  const f0 = evaluateCustomFormula(formula, 0, value1, value2);
-  const f1 = evaluateCustomFormula(formula, 1, value1, value2);
-  const increasing = f1 >= f0;
+  if (!formula?.trim()) throw new Error('自定义公式不能为空');
+  const f0 = evaluateAxisFormula(formula, { t: 0, v1: value1, v2: value2 });
+  const f1 = evaluateAxisFormula(formula, { t: 1, v1: value1, v2: value2 });
+  const increasing = f1 > f0;
   let low = 0;
   let high = 1;
 
-  for (let index = 0; index < 50; index += 1) {
+  for (let index = 0; index < 60; index += 1) {
     const mid = (low + high) / 2;
-    const value = evaluateCustomFormula(formula, mid, value1, value2);
-    if ((increasing && value < target) || (!increasing && value > target)) {
+    const evaluated = evaluateAxisFormula(formula, { t: mid, v1: value1, v2: value2 });
+    if ((increasing && evaluated < target) || (!increasing && evaluated > target)) {
       low = mid;
     } else {
       high = mid;
@@ -244,6 +125,27 @@ function solveCustomAxisRatio(
   return (low + high) / 2;
 }
 
+function toAxisConfig(
+  axisScales: CalculateRealValueParams['axisScales'],
+  axisFormulas: CalculateRealValueParams['axisFormulas'],
+  axisLogInputModes: CalculateRealValueParams['axisLogInputModes']
+): { x: AxisConfig; y: AxisConfig } {
+  return {
+    x: {
+      label: '',
+      scale: axisScales.x,
+      formula: axisFormulas?.x,
+      logInputMode: axisLogInputModes?.x
+    },
+    y: {
+      label: '',
+      scale: axisScales.y,
+      formula: axisFormulas?.y,
+      logInputMode: axisLogInputModes?.y
+    }
+  };
+}
+
 export function calculateRealValue({
   screenX,
   screenY,
@@ -251,35 +153,61 @@ export function calculateRealValue({
   calibrationValues,
   axisScales,
   axisFormulas,
-  axisLogInputModes
-}: CalculateRealValueParams): { realX: number; realY: number } {
-  // X Calculation
-  const xRatio = (screenX - calibrationLines.x1) / (calibrationLines.x2 - calibrationLines.x1);
+  axisLogInputModes,
+  imageData
+}: CalculateRealValueParams): CoordinateResult {
+  const axisConfig = toAxisConfig(axisScales, axisFormulas, axisLogInputModes);
+  const validation = validateCalibration({
+    calibrationLines,
+    calibrationValues,
+    axisConfig,
+    imageData
+  });
+  const errors = validation.issues.filter((issue) => issue.severity === 'error');
+  if (errors.length > 0) return { ok: false, issues: errors };
+
+  const xRatio =
+    (screenX - calibrationLines.x1) / (calibrationLines.x2 - calibrationLines.x1);
+  const yRatio =
+    (screenY - calibrationLines.y1) / (calibrationLines.y2 - calibrationLines.y1);
   const realX = interpolateAxisValue(
     xRatio,
-    {
-      scale: axisScales.x,
-      formula: axisFormulas?.x,
-      logInputMode: axisLogInputModes?.x
-    },
+    axisConfig.x,
     calibrationValues.x1,
     calibrationValues.x2
   );
-
-  // Y Calculation
-  const yRatio = (screenY - calibrationLines.y1) / (calibrationLines.y2 - calibrationLines.y1);
   const realY = interpolateAxisValue(
     yRatio,
-    {
-      scale: axisScales.y,
-      formula: axisFormulas?.y,
-      logInputMode: axisLogInputModes?.y
-    },
+    axisConfig.y,
     calibrationValues.y1,
     calibrationValues.y2
   );
 
-  return { realX, realY };
+  const issues: CalibrationIssue[] = [];
+  if (!Number.isFinite(realX)) {
+    issues.push({
+      axis: 'x',
+      severity: 'error',
+      code: 'non-finite-result',
+      message: 'X 轴坐标换算产生了非有限值'
+    });
+  }
+  if (!Number.isFinite(realY)) {
+    issues.push({
+      axis: 'y',
+      severity: 'error',
+      code: 'non-finite-result',
+      message: 'Y 轴坐标换算产生了非有限值'
+    });
+  }
+  if (issues.length > 0) return { ok: false, issues };
+
+  return {
+    ok: true,
+    realX,
+    realY,
+    qualityFlags: getPointQualityFlags(screenX, screenY, calibrationLines)
+  };
 }
 
 export function calculateScreenValue({
@@ -291,35 +219,27 @@ export function calculateScreenValue({
   axisFormulas,
   axisLogInputModes
 }: CalculateScreenValueParams): { screenX: number; screenY: number } {
+  const axisConfig = toAxisConfig(axisScales, axisFormulas, axisLogInputModes);
   const xRatio = resolveAxisRatio(
     realX,
-    {
-      scale: axisScales.x,
-      formula: axisFormulas?.x,
-      logInputMode: axisLogInputModes?.x
-    },
+    axisConfig.x,
     calibrationValues.x1,
     calibrationValues.x2
   );
   const yRatio = resolveAxisRatio(
     realY,
-    {
-      scale: axisScales.y,
-      formula: axisFormulas?.y,
-      logInputMode: axisLogInputModes?.y
-    },
+    axisConfig.y,
     calibrationValues.y1,
     calibrationValues.y2
   );
-
-  return {
-    screenX:
-      calibrationLines.x1 +
-      xRatio * (calibrationLines.x2 - calibrationLines.x1),
-    screenY:
-      calibrationLines.y1 +
-      yRatio * (calibrationLines.y2 - calibrationLines.y1)
-  };
+  const screenX =
+    calibrationLines.x1 + xRatio * (calibrationLines.x2 - calibrationLines.x1);
+  const screenY =
+    calibrationLines.y1 + yRatio * (calibrationLines.y2 - calibrationLines.y1);
+  if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) {
+    throw new RangeError('坐标反算产生了非有限值');
+  }
+  return { screenX, screenY };
 }
 
 export function formatNumber(

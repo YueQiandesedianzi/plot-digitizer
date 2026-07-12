@@ -1,9 +1,11 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useAppStore } from '../store/appStore';
 import { calculateRealValue } from '../utils/coordinate';
+import { validateCalibration } from '../domain/calibration';
 
 export function useCalibration() {
   const {
+    imageData,
     calibrationLines,
     calibrationValues,
     axisConfig,
@@ -17,6 +19,17 @@ export function useCalibration() {
 
   const [draggingLine, setDraggingLine] = useState<string | null>(null);
 
+  const calibrationValidation = useMemo(
+    () =>
+      validateCalibration({
+        calibrationLines,
+        calibrationValues,
+        axisConfig,
+        imageData
+      }),
+    [axisConfig, calibrationLines, calibrationValues, imageData]
+  );
+
   const getRealCoordinates = useCallback(
     (screenX: number, screenY: number) => {
       return calculateRealValue({
@@ -29,10 +42,11 @@ export function useCalibration() {
         axisLogInputModes: {
           x: axisConfig.x.logInputMode,
           y: axisConfig.y.logInputMode
-        }
+        },
+        imageData
       });
     },
-    [calibrationLines, calibrationValues, axisConfig]
+    [calibrationLines, calibrationValues, axisConfig, imageData]
   );
 
   const handleMouseDown = useCallback(
@@ -70,6 +84,7 @@ export function useCalibration() {
     calibrationLines,
     calibrationValues,
     axisConfig,
+    calibrationValidation,
     setCalibrationLine,
     setCalibrationValue,
     setAxisScale,

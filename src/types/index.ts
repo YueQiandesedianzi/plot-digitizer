@@ -1,5 +1,45 @@
 export type AxisScale = 'linear' | 'log' | 'log10' | 'ln' | 'custom';
 export type LogInputMode = 'value' | 'exponent';
+export type PointQualityFlag = 'outside-calibration';
+export type ExportSchema = 'v2.1' | 'legacy-v2.0';
+export type ExportValueMode = 'full' | 'rounded';
+
+export type CalibrationIssueCode =
+  | 'image-not-ready'
+  | 'screen-span-too-small'
+  | 'screen-span-low-accuracy'
+  | 'non-finite-value'
+  | 'equal-values'
+  | 'log-nonpositive'
+  | 'formula-empty'
+  | 'formula-syntax'
+  | 'formula-nonfinite'
+  | 'formula-nonmonotonic'
+  | 'non-finite-result';
+
+export interface CalibrationIssue {
+  axis: 'x' | 'y';
+  severity: 'error' | 'warning';
+  code: CalibrationIssueCode;
+  message: string;
+}
+
+export interface CalibrationValidationResult {
+  valid: boolean;
+  issues: CalibrationIssue[];
+}
+
+export type CoordinateResult =
+  | {
+      ok: true;
+      realX: number;
+      realY: number;
+      qualityFlags: PointQualityFlag[];
+    }
+  | {
+      ok: false;
+      issues: CalibrationIssue[];
+    };
 
 export interface CalibrationLines {
   x1: number;
@@ -30,6 +70,7 @@ export interface DataPoint {
   realY: number;
   label: string;
   visible?: boolean;
+  qualityFlags?: PointQualityFlag[];
 }
 
 export interface CurvePoint extends DataPoint {
@@ -72,6 +113,84 @@ export interface ImageData {
 
 export type AppStep = 'calibration' | 'digitizing';
 export type CollectionMode = 'point' | 'curve';
+export type ProjectSourceKind = 'image' | 'pdf';
+
+export interface SourceReplacement {
+  file: File;
+  kind: ProjectSourceKind;
+  pageCount: number;
+  firstPageImage: ImageData;
+}
+
+export interface ProjectSourceRef {
+  kind: ProjectSourceKind;
+  originalName: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  archivePath: string;
+  pageCount: number;
+}
+
+export interface ProjectScreenshotRef {
+  name: string;
+  archivePath: string;
+  createdAt: string;
+  mimeType: string;
+}
+
+export interface ProjectPlotV1 {
+  id: string;
+  name: string;
+  calibrationLines: CalibrationLines;
+  calibrationValues: CalibrationValues;
+  axisConfig: { x: AxisConfig; y: AxisConfig };
+  dataPoints: DataPoint[];
+  curves: CurveSeries[];
+  activeCurveId: string | null;
+  collectionMode: CollectionMode;
+  defaultSampleLabel: string;
+  screenshot?: ProjectScreenshotRef;
+}
+
+export interface ProjectPageV1 {
+  pageNumber: number;
+  currentStep: AppStep;
+  activePlotId: string;
+  plots: ProjectPlotV1[];
+}
+
+export interface ProjectDocumentV1 {
+  schemaVersion: 1;
+  calculationVersion: 1;
+  appVersion: string;
+  projectId: string;
+  createdAt: string;
+  updatedAt: string;
+  currentPageNumber: number;
+  source: ProjectSourceRef;
+  pages: ProjectPageV1[];
+  preferences: {
+    showCoordinateGuide: boolean;
+    showMagnifierDataOverlay: boolean;
+  };
+}
+
+export interface ProjectReplacement {
+  document: ProjectDocumentV1;
+  sourceFile: File;
+  currentImage: ImageData;
+  pageSessions: Record<number, PageSession>;
+  fileName?: string;
+}
+
+export interface ProjectFileBridge {
+  openProject(): Promise<{ name: string; bytes: ArrayBuffer } | null>;
+  saveProject(input: {
+    defaultName: string;
+    bytes: ArrayBuffer;
+  }): Promise<{ saved: boolean; name?: string }>;
+}
 
 export interface PlotRegion {
   id: string;
@@ -104,10 +223,32 @@ export interface PageSession {
 }
 
 export interface AppState {
+  // Project lifecycle and per-page history
+  isDirty: boolean;
+  changeRevision: number;
+  projectId: string;
+  projectCreatedAt: string;
+  projectUpdatedAt: string;
+  projectFileName: string | null;
+  canUndo: boolean;
+  canRedo: boolean;
+  markDirty: () => void;
+  markSaved: (updatedAt?: string) => void;
+  clearHistory: () => void;
+  commitHistoryBoundary: () => void;
+  undo: () => void;
+  redo: () => void;
+  setProjectFileName: (name: string | null) => void;
+  replaceProject: (replacement: ProjectReplacement) => void;
+
   // Image
   imageData: ImageData;
+  sourceFile: File | null;
+  sourceKind: ProjectSourceKind | null;
+  sourcePageCount: number;
   setImageData: (data: Partial<ImageData>) => void;
   resetImage: () => void;
+  replaceSource: (replacement: SourceReplacement) => void;
 
   // Calibration
   calibrationLines: CalibrationLines;
@@ -205,6 +346,8 @@ export interface AppState {
 export interface ExportOptions {
   format: 'csv' | 'xlsx';
   precision: number;
+  schema?: ExportSchema;
+  valueMode?: ExportValueMode;
   delimiter?: ',' | '\t' | ' ';
   dataScope?: 'points' | 'curve-controls' | 'curve-interpolated' | 'all';
   pageScope?: 'current' | 'all';

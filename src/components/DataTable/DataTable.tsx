@@ -1,4 +1,4 @@
-import { Eye, EyeOff, Trash2 } from 'lucide-react';
+import { AlertTriangle, Eye, EyeOff, Trash2 } from 'lucide-react';
 import type { WheelEvent } from 'react';
 import { useAppStore } from '../../store/appStore';
 import { formatNumber } from '../../utils/coordinate';
@@ -14,7 +14,8 @@ export function DataTable({ className = '' }: DataTableProps) {
     updateDataPointPosition,
     updateDataPointLabel,
     updateDataPointVisibility,
-    axisConfig
+    axisConfig,
+    commitHistoryBoundary
   } = useAppStore();
 
   const handlePointWheel = (
@@ -44,7 +45,10 @@ export function DataTable({ className = '' }: DataTableProps) {
   }
 
   return (
-    <div className={`overflow-auto custom-scrollbar bg-slate-50/30 ${className}`}>
+    <div
+      className={`overflow-auto custom-scrollbar bg-slate-50/30 ${className}`}
+      onBlurCapture={commitHistoryBoundary}
+    >
       <table className="w-full text-left border-collapse table-fixed">
         <thead className="bg-slate-100 sticky top-0 z-10 text-xs text-slate-600 shadow-sm">
           <tr>
@@ -64,7 +68,16 @@ export function DataTable({ className = '' }: DataTableProps) {
               }`}
             >
               <td className="p-2 text-center text-slate-400 font-mono">
-                {index + 1}
+                <span className="inline-flex items-center gap-1">
+                  {index + 1}
+                  {point.qualityFlags?.includes('outside-calibration') && (
+                    <AlertTriangle
+                      size={11}
+                      className="text-amber-500"
+                      aria-label="校准框外点"
+                    />
+                  )}
+                </span>
               </td>
               <td className="p-2">
                 <input
