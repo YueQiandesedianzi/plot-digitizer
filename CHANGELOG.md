@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.0
+
+- 增加证据链导出：ZIP 包新增 `evidence/evidence_report.json`，记录源文件、页面/图区域、坐标轴、校准问题、点数统计、质量标记和每张图的 `accepted` / `needs_review` / `invalid` 状态。
+- XLSX 新增 `Evidence` sheet，将每张图的证据摘要展开为可筛选表格；`Project` sheet 增加 evidence schema 版本。
+- 扩展 `quality_flags`，导出行会标记 `manual-point`、`curve-control`、`curve-interpolated`、`auto-traced`、`low-confidence`、`needs-review` 等来源和风险信息。
+- 自动追踪确认后的点会保留 `auto-traced` 标记；低置信追踪结果会额外标记 `low-confidence` 和 `needs-review`，避免候选结果被误认为普通手动点。
+- 保持 canonical CSV/XLSX 的 v2.1 长表 schema 兼容，v2.2 作为证据和复核增强层提供。
+
 ## 2.1.0
 
 - 增加统一校准校验、安全自定义公式解析和 `outside-calibration` 质量标记。

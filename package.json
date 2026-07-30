@@ -1,6 +1,6 @@
 {
   "name": "plot-digitizer",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "图表数字化工具 - PlotDigitizer",
   "author": "YQDSDZ",
   "main": "electron/main.js",

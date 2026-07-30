@@ -327,6 +327,10 @@ export function DigitizingPanel({
     const preview = tracePreviews[curveId];
     if (!curve || !preview) return;
 
+    const traceQualityFlags =
+      preview.confidence < 60
+        ? (['auto-traced', 'low-confidence', 'needs-review'] as const)
+        : (['auto-traced'] as const);
     const newPoints = preview.points
       .filter(
         (point) =>
@@ -338,7 +342,18 @@ export function DigitizingPanel({
               ) < 0.6
           )
       )
-      .map((point) => buildCurvePointsFromTrace(curve.name, [point])[0]);
+      .flatMap((point) =>
+        buildCurvePointsFromTrace(curve.name, [point]).map((tracePoint) => ({
+          ...tracePoint,
+          confidence: preview.confidence,
+          qualityFlags: [
+            ...new Set([
+              ...(tracePoint.qualityFlags ?? []),
+              ...traceQualityFlags
+            ])
+          ]
+        }))
+      );
 
     addCurvePointsToCurve(curveId, newPoints);
     setTraceStatus((previous) => ({

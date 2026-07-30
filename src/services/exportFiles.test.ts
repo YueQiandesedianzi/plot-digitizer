@@ -111,13 +111,14 @@ describe('v2.1 trusted exports', () => {
     expect(secondRow).toContain('outside-calibration');
   });
 
-  it('writes numeric X/Y cells and per-plot metadata into three sheets', () => {
+  it('writes numeric X/Y cells and evidence metadata into four sheets', () => {
     const workbook = XLSX.read(buildWorkbookBytes(params()), { type: 'array' });
-    expect(workbook.SheetNames).toEqual(['Data', 'Plots', 'Project']);
+    expect(workbook.SheetNames).toEqual(['Data', 'Plots', 'Evidence', 'Project']);
     const data = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets.Data);
     expect(typeof data[0].x_value).toBe('number');
     expect(data[0].x_value).toBe(firstPlot.dataPoints[0].realX);
-    expect(data[1].quality_flags).toBe('outside-calibration');
+    expect(data[0].quality_flags).toBe('manual-point');
+    expect(data[1].quality_flags).toBe('manual-point;outside-calibration');
 
     const plots = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets.Plots);
     expect(plots[0]).toMatchObject({ x_label: 'Time', x_scale: 'linear' });
@@ -125,6 +126,19 @@ describe('v2.1 trusted exports', () => {
       x_label: 'Frequency',
       x_scale: 'log10',
       y_label: 'Modulus'
+    });
+
+    const evidence = XLSX.utils.sheet_to_json<Record<string, unknown>>(
+      workbook.Sheets.Evidence
+    );
+    expect(evidence[0]).toMatchObject({
+      evidence_schema_version: '2.2',
+      status: 'accepted',
+      manual_points: 1
+    });
+    expect(evidence[1]).toMatchObject({
+      status: 'needs_review',
+      outside_calibration_points: 1
     });
   });
 
@@ -138,12 +152,17 @@ describe('v2.1 trusted exports', () => {
       const zip = await JSZip.loadAsync(bytes);
       const manifest = JSON.parse(await zip.file('manifest.json')!.async('string'));
       expect(manifest.canonical.row_count).toBe(2);
+      expect(manifest.evidence_report).toBe('evidence/evidence_report.json');
       expect(manifest.legacy_files).toHaveLength(2);
       expect(zip.file(manifest.canonical.csv)).not.toBeNull();
       expect(zip.file(manifest.canonical.xlsx)).not.toBeNull();
+      expect(zip.file(manifest.evidence_report)).not.toBeNull();
       expect(Object.keys(zip.files).filter((name) => name.startsWith('plots/') && name.endsWith('.xlsx'))).toHaveLength(2);
 
       const canonicalCsv = await zip.file(manifest.canonical.csv)!.async('string');
+      const evidenceReport = JSON.parse(
+        await zip.file(manifest.evidence_report)!.async('string')
+      );
       const canonicalWorkbook = XLSX.read(
         await zip.file(manifest.canonical.xlsx)!.async('arraybuffer'),
         { type: 'array' }
@@ -152,6 +171,8 @@ describe('v2.1 trusted exports', () => {
         canonicalWorkbook.Sheets.Data
       );
       expect(canonicalCsv).toContain('point-a');
+      expect(evidenceReport.schema_version).toBe('2.2');
+      expect(evidenceReport.summary.needs_review_plot_count).toBe(1);
       expect(rows.map((row) => row.point_id)).toEqual(['point-a', 'point-b']);
     },
     20000

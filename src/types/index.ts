@@ -1,6 +1,17 @@
 export type AxisScale = 'linear' | 'log' | 'log10' | 'ln' | 'custom';
 export type LogInputMode = 'value' | 'exponent';
-export type PointQualityFlag = 'outside-calibration';
+export type PointQualityFlag =
+  | 'outside-calibration'
+  | 'manual-point'
+  | 'curve-control'
+  | 'curve-interpolated'
+  | 'auto-traced'
+  | 'low-confidence'
+  | 'needs-review'
+  | 'extrapolated'
+  | 'duplicate-x'
+  | 'near-axis'
+  | 'near-legend-or-text';
 export type ExportSchema = 'v2.1' | 'legacy-v2.0';
 export type ExportValueMode = 'full' | 'rounded';
 
@@ -71,6 +82,7 @@ export interface DataPoint {
   label: string;
   visible?: boolean;
   qualityFlags?: PointQualityFlag[];
+  confidence?: number;
 }
 
 export interface CurvePoint extends DataPoint {

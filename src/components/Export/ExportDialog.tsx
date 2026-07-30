@@ -65,6 +65,7 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
     collectionMode,
     defaultSampleLabel,
     plotRegions,
+    sourceKind,
     deleteExportItem
   } = useAppStore();
   const [exportOptions, setExportOptions] = useState<ExportOptions>({
@@ -220,6 +221,7 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
       calibrationValues,
       imageData,
       pageSessions: renamedPageSessions,
+      sourceKind,
       options: exportOptions
     }),
     [
@@ -231,7 +233,8 @@ export function ExportDialog({ isOpen, onClose, onJumpToPage }: ExportDialogProp
       dataPoints,
       exportOptions,
       imageData,
-      renamedPageSessions
+      renamedPageSessions,
+      sourceKind
     ]
   );
   const selectedRowCount = useMemo(
