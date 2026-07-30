@@ -6,7 +6,9 @@ import {
   CANONICAL_EXPORT_COLUMNS,
   type ExportDataParams,
   type ExportPlot,
+  type EvidenceReport,
   buildCanonicalRecords,
+  buildEvidenceReport,
   buildExportRows,
   expandExportPlots,
   getSelectedExportPages,
@@ -92,8 +94,11 @@ export async function buildBundleBytes(
   const safeBaseName = sanitizeFilename(packageBaseName) || 'plotdigitizer_export';
   const csvPath = `canonical/${safeBaseName}-v2.1.csv`;
   const xlsxPath = `canonical/${safeBaseName}-v2.1.xlsx`;
+  const evidenceReportPath = 'evidence/evidence_report.json';
   zip.file(csvPath, buildCanonicalCsv(canonicalParams));
   zip.file(xlsxPath, buildWorkbookBytes(canonicalParams));
+  const evidenceReport = buildEvidenceReport(canonicalParams);
+  zip.file(evidenceReportPath, JSON.stringify(evidenceReport, null, 2));
 
   const screenshotPaths: string[] = [];
   const plotWorkbookPaths: string[] = [];
@@ -143,6 +148,7 @@ export async function buildBundleBytes(
         },
         plot_workbooks: plotWorkbookPaths,
         screenshots: screenshotPaths,
+        evidence_report: evidenceReportPath,
         summary_pptx: summaryPath,
         legacy_files: legacyPaths
       },
@@ -210,9 +216,15 @@ export function buildWorkbookBytes(
   );
   XLSX.utils.book_append_sheet(
     workbook,
+    XLSX.utils.json_to_sheet(buildEvidenceSheetRows(buildEvidenceReport(params))),
+    'Evidence'
+  );
+  XLSX.utils.book_append_sheet(
+    workbook,
     XLSX.utils.aoa_to_sheet([
       ['key', 'value'],
       ['schema_version', '2.1'],
+      ['evidence_schema_version', '2.2'],
       ['generated_at', new Date().toISOString()],
       ['page_count', new Set(plots.map((plot) => plot.pageNumber)).size],
       ['plot_count', plots.length],
@@ -387,6 +399,38 @@ function buildPlotMetadataRow(plot: ExportPlot): Record<string, string | number>
     point_count: plot.dataPoints.length,
     curve_count: plot.curves.length
   };
+}
+
+function buildEvidenceSheetRows(
+  report: EvidenceReport
+): Array<Record<string, string | number | boolean>> {
+  return report.plots.map((plot) => ({
+    evidence_schema_version: report.schema_version,
+    source_name: report.source.name,
+    source_kind: report.source.kind,
+    source_sha256: report.source.sha256 ?? '',
+    page: plot.page,
+    plot_id: plot.plot_id,
+    plot_name: plot.plot_name,
+    status: plot.quality.status,
+    needs_review: plot.quality.needs_review,
+    quality_flags: plot.quality.flags.join(';'),
+    calibration_issue_count: plot.calibration.issue_count,
+    calibration_warning_count: plot.calibration.warning_count,
+    calibration_error_count: plot.calibration.error_count,
+    manual_points: plot.data_summary.manual_points,
+    curve_control_points: plot.data_summary.curve_control_points,
+    curve_interpolated_points: plot.data_summary.curve_interpolated_points,
+    auto_traced_points: plot.data_summary.auto_traced_points,
+    low_confidence_points: plot.data_summary.low_confidence_points,
+    outside_calibration_points: plot.data_summary.outside_calibration_points,
+    x_label: plot.axis.x_label,
+    x_scale: plot.axis.x_scale,
+    y_label: plot.axis.y_label,
+    y_scale: plot.axis.y_scale,
+    image_width: plot.source_image.natural_width,
+    image_height: plot.source_image.natural_height
+  }));
 }
 
 function escapeCSVField(value: string, delimiter: string): string {

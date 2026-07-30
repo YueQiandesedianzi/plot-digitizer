@@ -7,11 +7,13 @@ import {
   ExportOptions,
   ImageData,
   PageSession,
+  PointQualityFlag,
+  ProjectSourceKind,
   PlotRegion
 } from '../types';
 import { formatNumber } from '../utils/coordinate';
 import { generateInterpolatedPoints } from '../utils/interpolation';
-import { getPointQualityFlags } from './calibration';
+import { getPointQualityFlags, validateCalibration } from './calibration';
 
 export interface ExportDataParams {
   pageNumber?: number;
@@ -22,6 +24,8 @@ export interface ExportDataParams {
   calibrationValues: CalibrationValues;
   imageData?: ImageData;
   pageSessions?: PageSession[];
+  sourceKind?: ProjectSourceKind | null;
+  sourceSha256?: string;
   options: ExportOptions;
 }
 
@@ -94,6 +98,70 @@ export type CanonicalExportRecord = Record<
   string | number
 >;
 
+export interface EvidenceReport {
+  schema_version: '2.2';
+  generated_at: string;
+  source: {
+    name: string;
+    kind: ProjectSourceKind | 'unknown';
+    sha256: string | null;
+    page_count: number;
+  };
+  summary: {
+    page_count: number;
+    plot_count: number;
+    row_count: number;
+    accepted_plot_count: number;
+    needs_review_plot_count: number;
+    invalid_plot_count: number;
+    quality_flag_counts: Record<string, number>;
+  };
+  plots: EvidencePlotReport[];
+}
+
+export interface EvidencePlotReport {
+  page: number;
+  plot_id: string;
+  plot_name: string;
+  source_image: {
+    name: string;
+    natural_width: number;
+    natural_height: number;
+  };
+  axis: {
+    x_label: string;
+    x_scale: string;
+    y_label: string;
+    y_scale: string;
+  };
+  calibration: {
+    lines_percent: CalibrationLines;
+    values: CalibrationValues;
+    issue_count: number;
+    warning_count: number;
+    error_count: number;
+    issues: Array<{
+      axis: 'x' | 'y';
+      severity: 'error' | 'warning';
+      code: string;
+      message: string;
+    }>;
+  };
+  data_summary: {
+    manual_points: number;
+    curve_control_points: number;
+    curve_interpolated_points: number;
+    auto_traced_points: number;
+    low_confidence_points: number;
+    outside_calibration_points: number;
+  };
+  quality: {
+    status: 'accepted' | 'needs_review' | 'invalid';
+    flags: string[];
+    needs_review: boolean;
+  };
+}
+
 export function getSelectedExportPages(params: ExportDataParams): ExportPage[] {
   const fallbackPage: ExportPage = {
     pageNumber: params.pageNumber ?? 1,
@@ -138,7 +206,7 @@ export function buildCanonicalRecords(
             label: point.label,
             realX: point.realX,
             realY: point.realY,
-            qualityFlags: point.qualityFlags ?? [],
+            qualityFlags: mergeQualityFlags(['manual-point'], point.qualityFlags),
             interpolation: ''
           })
         );
@@ -158,7 +226,7 @@ export function buildCanonicalRecords(
               label: point.label,
               realX: point.realX,
               realY: point.realY,
-              qualityFlags: point.qualityFlags ?? [],
+              qualityFlags: mergeQualityFlags(['curve-control'], point.qualityFlags),
               interpolation: curve.interpolation
             })
           );
@@ -185,7 +253,9 @@ export function buildCanonicalRecords(
                 point.screenX,
                 point.screenY,
                 plot.calibrationLines
-              ),
+              ).includes('outside-calibration')
+                ? ['curve-interpolated', 'outside-calibration']
+                : ['curve-interpolated'],
               interpolation: curve.interpolation
             })
           );
@@ -194,6 +264,41 @@ export function buildCanonicalRecords(
     });
   });
   return records;
+}
+
+export function buildEvidenceReport(params: ExportDataParams): EvidenceReport {
+  const pages = getSelectedExportPages(params);
+  const plots = expandExportPlots(pages);
+  const records = buildCanonicalRecords(params);
+  const plotReports = plots.map((plot) => buildEvidencePlotReport(plot, pages));
+  const qualityFlagCounts = countQualityFlags(records);
+
+  return {
+    schema_version: '2.2',
+    generated_at: new Date().toISOString(),
+    source: {
+      name: params.imageData?.name ?? '',
+      kind: params.sourceKind ?? 'unknown',
+      sha256: params.sourceSha256 ?? null,
+      page_count: pages.length
+    },
+    summary: {
+      page_count: pages.length,
+      plot_count: plots.length,
+      row_count: records.length,
+      accepted_plot_count: plotReports.filter(
+        (plot) => plot.quality.status === 'accepted'
+      ).length,
+      needs_review_plot_count: plotReports.filter(
+        (plot) => plot.quality.status === 'needs_review'
+      ).length,
+      invalid_plot_count: plotReports.filter(
+        (plot) => plot.quality.status === 'invalid'
+      ).length,
+      quality_flag_counts: qualityFlagCounts
+    },
+    plots: plotReports
+  };
 }
 
 interface CanonicalPointInput {
@@ -243,6 +348,154 @@ function logInputMode(config: AxisConfig): string {
   return ['log', 'log10', 'ln'].includes(config.scale)
     ? config.logInputMode ?? 'value'
     : '';
+}
+
+function mergeQualityFlags(
+  baseFlags: PointQualityFlag[],
+  extraFlags: PointQualityFlag[] = []
+): PointQualityFlag[] {
+  return [...new Set([...baseFlags, ...extraFlags])];
+}
+
+function buildEvidencePlotReport(
+  plot: ExportPlot,
+  pages: ExportPage[]
+): EvidencePlotReport {
+  const page = pages.find((item) => item.pageNumber === plot.pageNumber);
+  const calibration = validateCalibration({
+    calibrationLines: plot.calibrationLines,
+    calibrationValues: plot.calibrationValues,
+    axisConfig: plot.axisConfig,
+    imageData:
+      page?.imageData.naturalWidth && page.imageData.naturalHeight
+        ? page.imageData
+        : undefined
+  });
+  const curveInterpolatedCount = plot.curves.reduce(
+    (sum, curve) =>
+      sum +
+      generateInterpolatedPoints(
+        curve,
+        plot.axisConfig,
+        plot.calibrationLines,
+        plot.calibrationValues
+      ).length,
+    0
+  );
+  const allOriginalPoints = [
+    ...plot.dataPoints,
+    ...plot.curves.flatMap((curve) => curve.controlPoints)
+  ];
+  const allFlags = allOriginalPoints.flatMap((point) => point.qualityFlags ?? []);
+  const outsideCalibrationCount =
+    allOriginalPoints.filter((point) =>
+      point.qualityFlags?.includes('outside-calibration')
+    ).length +
+    plot.curves.reduce(
+      (sum, curve) =>
+        sum +
+        generateInterpolatedPoints(
+          curve,
+          plot.axisConfig,
+          plot.calibrationLines,
+          plot.calibrationValues
+        ).filter((point) =>
+          getPointQualityFlags(
+            point.screenX,
+            point.screenY,
+            plot.calibrationLines
+          ).includes('outside-calibration')
+        ).length,
+      0
+    );
+  const reviewFlags = new Set<string>([
+    ...(outsideCalibrationCount > 0 ? ['outside-calibration'] : []),
+    ...allFlags.filter((flag) =>
+      [
+        'outside-calibration',
+        'low-confidence',
+        'needs-review',
+        'extrapolated',
+        'duplicate-x',
+        'near-axis',
+        'near-legend-or-text'
+      ].includes(flag)
+    ),
+    ...calibration.issues
+      .filter((issue) => issue.severity === 'warning')
+      .map((issue) => issue.code)
+  ]);
+  const errorCount = calibration.issues.filter(
+    (issue) => issue.severity === 'error'
+  ).length;
+  const status =
+    errorCount > 0 ? 'invalid' : reviewFlags.size > 0 ? 'needs_review' : 'accepted';
+
+  return {
+    page: plot.pageNumber,
+    plot_id: plot.plotId,
+    plot_name: plot.plotName,
+    source_image: {
+      name: page?.imageData.name ?? '',
+      natural_width: page?.imageData.naturalWidth ?? 0,
+      natural_height: page?.imageData.naturalHeight ?? 0
+    },
+    axis: {
+      x_label: plot.axisConfig.x.label,
+      x_scale: plot.axisConfig.x.scale,
+      y_label: plot.axisConfig.y.label,
+      y_scale: plot.axisConfig.y.scale
+    },
+    calibration: {
+      lines_percent: plot.calibrationLines,
+      values: plot.calibrationValues,
+      issue_count: calibration.issues.length,
+      warning_count: calibration.issues.filter(
+        (issue) => issue.severity === 'warning'
+      ).length,
+      error_count: errorCount,
+      issues: calibration.issues.map((issue) => ({
+        axis: issue.axis,
+        severity: issue.severity,
+        code: issue.code,
+        message: issue.message
+      }))
+    },
+    data_summary: {
+      manual_points: plot.dataPoints.length,
+      curve_control_points: plot.curves.reduce(
+        (sum, curve) => sum + curve.controlPoints.length,
+        0
+      ),
+      curve_interpolated_points: curveInterpolatedCount,
+      auto_traced_points: allOriginalPoints.filter((point) =>
+        point.qualityFlags?.includes('auto-traced')
+      ).length,
+      low_confidence_points: allOriginalPoints.filter((point) =>
+        point.qualityFlags?.includes('low-confidence')
+      ).length,
+      outside_calibration_points: outsideCalibrationCount
+    },
+    quality: {
+      status,
+      flags: [...reviewFlags],
+      needs_review: status !== 'accepted'
+    }
+  };
+}
+
+function countQualityFlags(
+  records: CanonicalExportRecord[]
+): Record<string, number> {
+  return records.reduce<Record<string, number>>((counts, record) => {
+    String(record.quality_flags)
+      .split(';')
+      .filter(Boolean)
+      .forEach((flag) => {
+        counts[flag] = (counts[flag] ?? 0) + 1;
+      });
+    return counts;
+  }, {});
 }
 
 export function buildExportRows({
